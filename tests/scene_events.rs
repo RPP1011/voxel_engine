@@ -23,7 +23,7 @@ fn no_events_initially() {
 #[test]
 fn drain_events_clears_queue() {
     let mut scene = test_scene();
-    let handle = scene.spawn(small_grid(), Transform::default(), MaterialPalette::new());
+    let handle = scene.spawn(&small_grid(), Transform::default(), &MaterialPalette::new());
     scene.push_event(SceneEvent::EntityAtRest { handle });
     let events: Vec<SceneEvent> = scene.drain_events().collect();
     assert_eq!(events.len(), 1);
@@ -34,8 +34,8 @@ fn drain_events_clears_queue() {
 #[test]
 fn multiple_events_preserved_in_order() {
     let mut scene = test_scene();
-    let h1 = scene.spawn(small_grid(), Transform::default(), MaterialPalette::new());
-    let h2 = scene.spawn(small_grid(), Transform::default(), MaterialPalette::new());
+    let h1 = scene.spawn(&small_grid(), Transform::default(), &MaterialPalette::new());
+    let h2 = scene.spawn(&small_grid(), Transform::default(), &MaterialPalette::new());
     scene.push_event(SceneEvent::EntityAtRest { handle: h1 });
     scene.push_event(SceneEvent::EntityAtRest { handle: h2 });
     let events: Vec<SceneEvent> = scene.drain_events().collect();
