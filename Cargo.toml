@@ -1,0 +1,31 @@
+[package]
+name = "voxel_engine"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+app-harness = ["dep:winit", "dep:egui"]
+compile-shaders = ["dep:shaderc"]
+tracing = ["dep:tracing"]
+
+[dependencies]
+ash = "0.38"
+ash-window = "0.13"
+gpu-allocator = { version = "0.27", features = ["vulkan"] }
+raw-window-handle = "0.6"
+glam = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+thiserror = "2"
+anyhow = "1"
+dot_vox = "5"
+
+# Optional
+winit = { version = "0.30", optional = true }
+egui = { version = "0.31", optional = true }
+shaderc = { version = "0.8", optional = true }
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+env_logger = "0.11"
