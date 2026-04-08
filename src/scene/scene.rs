@@ -6,6 +6,7 @@ use crate::scene::handle::{ChunkHandle, EntityHandle};
 use crate::scene::transform::Transform;
 use crate::voxel::grid::VoxelGrid;
 use crate::voxel::material::MaterialPalette;
+use crate::world::spatial::RayHit;
 use glam::{IVec3, Vec3};
 
 enum VoxelMutation {
@@ -410,5 +411,80 @@ impl Scene {
     /// Number of currently loaded chunks.
     pub fn loaded_chunk_count(&self) -> usize {
         self.chunks.iter().filter(|s| s.loaded).count()
+    }
+
+    // -------------------------------------------------------------------------
+    // Spatial queries (Task 15)
+    // -------------------------------------------------------------------------
+
+    /// Cast a ray through all live entities and return the closest hit within
+    /// `max_dist` world-space units, or `None` if nothing was hit.
+    pub fn raycast(&self, origin: Vec3, direction: Vec3, max_dist: f32) -> Option<RayHit> {
+        let dir = direction.normalize_or_zero();
+        let mut best: Option<RayHit> = None;
+
+        for (i, slot) in self.entities.iter().enumerate() {
+            if !slot.alive { continue; }
+            let handle = EntityHandle { index: i as u32, generation: slot.generation };
+
+            // Transform ray into entity local space (assuming uniform scale)
+            let inv_rot = slot.transform.rotation.inverse();
+            let scale = slot.transform.scale.x; // uniform scale
+            let local_origin = inv_rot * ((origin - slot.transform.position) / scale);
+            let local_dir = (inv_rot * dir).normalize_or_zero();
+
+            if let Some(hit) = crate::voxel::raycast::ray_cast_grid(
+                &slot.grid,
+                [local_origin.x, local_origin.y, local_origin.z],
+                [local_dir.x, local_dir.y, local_dir.z],
+            ) {
+                let world_dist = hit.t * scale;
+                if world_dist < max_dist {
+                    if best.as_ref().is_none_or(|b| world_dist < b.distance) {
+                        best = Some(RayHit {
+                            entity: handle,
+                            point: origin + dir * world_dist,
+                            normal: Vec3::ZERO, // simplified
+                            voxel_pos: IVec3::new(hit.voxel.0 as i32, hit.voxel.1 as i32, hit.voxel.2 as i32),
+                            distance: world_dist,
+                        });
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Return all live entity handles whose bounding sphere overlaps a query
+    /// sphere of the given `center` and `radius`.
+    pub fn query_sphere(&self, center: Vec3, radius: f32) -> Vec<EntityHandle> {
+        self.entities.iter().enumerate()
+            .filter(|(_, s)| s.alive)
+            .filter(|(_, s)| {
+                let (w, h, d) = s.grid.dimensions();
+                let entity_radius = (w.max(h).max(d) as f32) * s.transform.scale.x * 0.5;
+                let dist2 = (s.transform.position - center).length_squared();
+                dist2 < (radius + entity_radius).powi(2)
+            })
+            .map(|(i, s)| EntityHandle { index: i as u32, generation: s.generation })
+            .collect()
+    }
+
+    /// Return all live entity handles whose axis-aligned bounding box overlaps
+    /// the query AABB defined by `min` and `max`.
+    pub fn query_aabb(&self, min: Vec3, max: Vec3) -> Vec<EntityHandle> {
+        self.entities.iter().enumerate()
+            .filter(|(_, s)| s.alive)
+            .filter(|(_, s)| {
+                let (w, h, d) = s.grid.dimensions();
+                let scale = s.transform.scale;
+                let ent_min = s.transform.position;
+                let ent_max = s.transform.position + Vec3::new(w as f32 * scale.x, h as f32 * scale.y, d as f32 * scale.z);
+                ent_min.x < max.x && ent_max.x > min.x
+                    && ent_min.y < max.y && ent_max.y > min.y
+                    && ent_min.z < max.z && ent_max.z > min.z
+            })
+            .map(|(i, s)| EntityHandle { index: i as u32, generation: s.generation })
+            .collect()
     }
 }
