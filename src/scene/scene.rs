@@ -8,6 +8,7 @@ pub(crate) struct EntitySlot {
     pub(crate) generation: u32,
     pub(crate) alive: bool,
     pub(crate) transform: Transform,
+    pub(crate) previous_transform: Transform,
     pub(crate) grid: VoxelGrid,
     pub(crate) palette: MaterialPalette,
 }
@@ -37,6 +38,7 @@ impl Scene {
             let slot = &mut self.entities[index as usize];
             slot.generation += 1;
             slot.alive = true;
+            slot.previous_transform = transform;
             slot.transform = transform;
             slot.grid = grid;
             slot.palette = palette;
@@ -46,6 +48,7 @@ impl Scene {
             self.entities.push(EntitySlot {
                 generation: 0,
                 alive: true,
+                previous_transform: transform,
                 transform,
                 grid,
                 palette,
@@ -72,9 +75,12 @@ impl Scene {
     }
 
     /// Update the world-space transform of an entity.
+    /// Saves the current transform as `previous_transform` before updating,
+    /// so that `interpolated_transform` can lerp between them.
     /// Silently ignores invalid or dead handles.
     pub fn set_transform(&mut self, handle: EntityHandle, transform: Transform) {
         if let Some(slot) = self.get_alive_slot_mut(handle) {
+            slot.previous_transform = slot.transform;
             slot.transform = transform;
         }
     }
@@ -90,6 +96,23 @@ impl Scene {
     /// Number of currently live entities.
     pub fn entity_count(&self) -> usize {
         self.entities.iter().filter(|s| s.alive).count()
+    }
+
+    /// Advance one simulation tick.
+    /// Applies any pending voxel mutations.
+    /// Transform snapshots for interpolation are recorded by `set_transform`.
+    pub fn tick_sim(&mut self) {
+        // Pending voxel mutations will be flushed here (see task 11).
+    }
+
+    /// Return an interpolated transform between the previous and current snapshots.
+    /// `t = 0.0` returns the previous snapshot; `t = 1.0` returns the current transform.
+    /// Returns `None` if the handle is invalid or the entity is dead.
+    pub fn interpolated_transform(&self, handle: EntityHandle, t: f32) -> Option<Transform> {
+        self.entities
+            .get(handle.index as usize)
+            .filter(|s| s.generation == handle.generation && s.alive)
+            .map(|s| s.previous_transform.lerp(&s.transform, t))
     }
 
     /// Mutable access to a slot for a live entity.  Intended for internal use
