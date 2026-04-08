@@ -1,0 +1,109 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer Positions   { vec4 positions[];   };
+layout(set = 0, binding = 1) buffer Velocities  { vec4 velocities[];  };
+layout(set = 0, binding = 2) buffer Densities   { float densities[];  };
+layout(set = 0, binding = 3) buffer CellCount   { uint cell_count[];  };
+layout(set = 0, binding = 4) buffer CellEntries { uint cell_entries[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_particles;
+    float kernel_radius;
+    float dt;
+    float stiffness;
+    float viscosity;
+    float gravity;
+    float rest_density;
+    uint table_size;
+    uint max_per_cell;
+    float cell_size;
+    float bounds_min_x, bounds_min_y, bounds_min_z;
+    float bounds_max_x, bounds_max_y, bounds_max_z;
+    float _pad0;
+};
+
+uint hash_cell(ivec3 cell) {
+    uint h = uint(cell.x * 73856093) ^ uint(cell.y * 19349663) ^ uint(cell.z * 83492791);
+    return h % table_size;
+}
+
+float spiky_gradient(float r, float h) {
+    if (r >= h || r < 1e-6) return 0.0;
+    float c = -45.0 / (3.14159265 * pow(h, 6.0));
+    float diff = h - r;
+    return c * diff * diff;
+}
+
+float visc_laplacian(float r, float h) {
+    if (r >= h) return 0.0;
+    float c = 45.0 / (3.14159265 * pow(h, 6.0));
+    return c * (h - r);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= num_particles) return;
+
+    vec3 pos_i = positions[idx].xyz;
+    vec3 vel_i = velocities[idx].xyz;
+    float dens_i = densities[idx];
+    float pi = stiffness * (dens_i - rest_density);
+    ivec3 cell_i = ivec3(floor(pos_i / cell_size));
+
+    vec3 force = vec3(0.0, gravity, 0.0);
+
+    for (int dz = -1; dz <= 1; dz++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                ivec3 nc = cell_i + ivec3(dx, dy, dz);
+                uint bucket = hash_cell(nc);
+                uint count = min(cell_count[bucket], max_per_cell);
+
+                for (uint s = 0; s < count; s++) {
+                    uint j = cell_entries[bucket * max_per_cell + s];
+                    if (j == idx) continue;
+
+                    vec3 diff = pos_i - positions[j].xyz;
+                    float r = length(diff);
+                    if (r < 1e-6 || r >= kernel_radius) continue;
+
+                    vec3 dir = diff / r;
+                    float dens_j = max(densities[j], 1e-6);
+                    float pj = stiffness * (dens_j - rest_density);
+
+                    // Pressure
+                    float grad = spiky_gradient(r, kernel_radius);
+                    float pressure_term = (pi + pj) / (2.0 * dens_j);
+                    force -= pressure_term * grad * dir;
+
+                    // Viscosity
+                    float visc = visc_laplacian(r, kernel_radius);
+                    force += viscosity * (velocities[j].xyz - vel_i) * visc / dens_j;
+                }
+            }
+        }
+    }
+
+    // Integration
+    vel_i += force * dt;
+    pos_i += vel_i * dt;
+
+    // Boundary clamping
+    vec3 bmin = vec3(bounds_min_x, bounds_min_y, bounds_min_z);
+    vec3 bmax = vec3(bounds_max_x, bounds_max_y, bounds_max_z);
+    for (int d = 0; d < 3; d++) {
+        if (pos_i[d] < bmin[d]) {
+            pos_i[d] = bmin[d];
+            vel_i[d] *= -0.3;
+        }
+        if (pos_i[d] > bmax[d]) {
+            pos_i[d] = bmax[d];
+            vel_i[d] *= -0.3;
+        }
+    }
+
+    positions[idx] = vec4(pos_i, 0.0);
+    velocities[idx] = vec4(vel_i, 0.0);
+}

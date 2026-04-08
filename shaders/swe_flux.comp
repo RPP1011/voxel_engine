@@ -1,0 +1,48 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) buffer Water     { float water[];     };
+layout(set = 0, binding = 1) buffer Terrain   { float terrain[];   };
+layout(set = 0, binding = 2) buffer FluxRight { float flux_right[]; };
+layout(set = 0, binding = 3) buffer FluxDown  { float flux_down[];  };
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    float dt;
+    float gravity; // g * pipe_area
+};
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint z = gl_GlobalInvocationID.y;
+    if (x >= width || z >= height) return;
+
+    uint i = z * width + x;
+    float surface_i = terrain[i] + water[i];
+
+    // Right flux
+    if (x + 1 < width) {
+        uint j = z * width + (x + 1);
+        float surface_j = terrain[j] + water[j];
+        float dh = surface_i - surface_j;
+        float flux = gravity * dh * dt;
+        float max_flux = (flux > 0.0) ? water[i] * 0.25 : water[j] * 0.25;
+        flux_right[i] = clamp(flux, -max_flux, max_flux);
+    } else {
+        flux_right[i] = 0.0;
+    }
+
+    // Down flux
+    if (z + 1 < height) {
+        uint j = (z + 1) * width + x;
+        float surface_j = terrain[j] + water[j];
+        float dh = surface_i - surface_j;
+        float flux = gravity * dh * dt;
+        float max_flux = (flux > 0.0) ? water[i] * 0.25 : water[j] * 0.25;
+        flux_down[i] = clamp(flux, -max_flux, max_flux);
+    } else {
+        flux_down[i] = 0.0;
+    }
+}

@@ -1,0 +1,55 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Linearized 3D grid stored in storage buffers
+layout(set = 0, binding = 0) readonly buffer VoxelInput {
+    uint voxels[]; // 0 = empty, nonzero = occupied
+} input_buf;
+
+layout(set = 0, binding = 1) buffer SdfOutput {
+    float distances[]; // signed distance field
+} output_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint dim_x;
+    uint dim_y;
+    uint dim_z;
+    uint pad;
+} pc;
+
+uint idx3d(uint x, uint y, uint z) {
+    return z * pc.dim_y * pc.dim_x + y * pc.dim_x + x;
+}
+
+void main() {
+    uint linear_idx = gl_GlobalInvocationID.x;
+    uint total = pc.dim_x * pc.dim_y * pc.dim_z;
+    if (linear_idx >= total) return;
+
+    uint z = linear_idx / (pc.dim_y * pc.dim_x);
+    uint rem = linear_idx % (pc.dim_y * pc.dim_x);
+    uint y = rem / pc.dim_x;
+    uint x = rem % pc.dim_x;
+
+    bool is_solid = input_buf.voxels[linear_idx] != 0;
+
+    // Brute-force nearest surface distance (for correctness, not performance)
+    float min_dist = 1e10;
+    uint search = 8u; // search radius
+
+    for (uint dz = 0; dz < pc.dim_z; dz++) {
+        for (uint dy = 0; dy < pc.dim_y; dy++) {
+            for (uint dx = 0; dx < pc.dim_x; dx++) {
+                bool other_solid = input_buf.voxels[idx3d(dx, dy, dz)] != 0;
+                if (other_solid != is_solid) {
+                    float d = distance(vec3(x, y, z), vec3(dx, dy, dz));
+                    min_dist = min(min_dist, d);
+                }
+            }
+        }
+    }
+
+    float sdf = is_solid ? -min_dist : min_dist;
+    output_buf.distances[linear_idx] = sdf;
+}

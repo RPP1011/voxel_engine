@@ -1,0 +1,27 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Body state: matches Rust GpuBodyState layout
+struct Body {
+    vec4 position_mass;      // xyz = position, w = mass
+    vec4 orientation;        // quaternion xyzw
+    vec4 linear_vel;         // xyz = linear velocity, w = pad
+    vec4 angular_vel;        // xyz = angular velocity, w = pad
+    mat4 inertia_aabb_sleep; // row0-2 = inertia 3x3 (padded), row3 = aabb_min(xyz) + sleep(w)
+    // Extra vec4 for aabb_max
+    vec4 aabb_max_pad;       // xyz = aabb_max, w = pad
+};
+
+layout(set = 0, binding = 0) buffer InputBodies {
+    Body bodies[];
+} input_buf;
+
+layout(set = 0, binding = 1) buffer OutputBodies {
+    Body bodies[];
+} output_buf;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    output_buf.bodies[idx] = input_buf.bodies[idx];
+}

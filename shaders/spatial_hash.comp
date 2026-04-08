@@ -1,0 +1,63 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+struct AABB {
+    vec4 min_pad; // xyz = min, w = body_id
+    vec4 max_pad; // xyz = max, w = pad
+};
+
+layout(set = 0, binding = 0) readonly buffer AABBs {
+    AABB aabbs[];
+} input_buf;
+
+layout(set = 0, binding = 1) buffer Hashes {
+    uvec2 entries[]; // x = hash, y = body_id
+} hash_buf;
+
+layout(set = 0, binding = 2) buffer PairCount {
+    uint count;
+    uint pairs[]; // pairs of (body_a, body_b)
+} pair_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint num_bodies;
+    float cell_size;
+    uint max_pairs;
+    uint pad;
+} pc;
+
+uint hash_cell(ivec3 cell) {
+    // Simple spatial hash
+    return uint((cell.x * 73856093) ^ (cell.y * 19349663) ^ (cell.z * 83492791)) & 0xFFFFu;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.num_bodies) return;
+
+    AABB a = input_buf.aabbs[idx];
+    vec3 center = (a.min_pad.xyz + a.max_pad.xyz) * 0.5;
+    ivec3 cell = ivec3(floor(center / pc.cell_size));
+    uint h = hash_cell(cell);
+
+    hash_buf.entries[idx] = uvec2(h, uint(a.min_pad.w)); // store hash + body_id
+
+    // Brute-force pair detection within same hash cell
+    // (In production, this would be sort + scan, but for correctness test: O(n²))
+    for (uint j = idx + 1; j < pc.num_bodies; j++) {
+        AABB b = input_buf.aabbs[j];
+
+        // AABB overlap test
+        bool overlap = all(lessThanEqual(a.min_pad.xyz, b.max_pad.xyz)) &&
+                       all(greaterThanEqual(a.max_pad.xyz, b.min_pad.xyz));
+
+        if (overlap) {
+            uint pair_idx = atomicAdd(pair_buf.count, 1);
+            if (pair_idx < pc.max_pairs) {
+                pair_buf.pairs[pair_idx * 2] = uint(a.min_pad.w);
+                pair_buf.pairs[pair_idx * 2 + 1] = uint(b.min_pad.w);
+            }
+        }
+    }
+}

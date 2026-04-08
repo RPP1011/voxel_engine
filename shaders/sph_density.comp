@@ -1,0 +1,59 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer Positions   { vec4 positions[];   };
+layout(set = 0, binding = 1) buffer Densities   { float densities[];  };
+layout(set = 0, binding = 2) buffer CellCount   { uint cell_count[];  };
+layout(set = 0, binding = 3) buffer CellEntries { uint cell_entries[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_particles;
+    float kernel_radius;
+    float poly6_coeff;
+    uint table_size;
+    uint max_per_cell;
+    float cell_size;
+    float _pad0;
+    float _pad1;
+};
+
+uint hash_cell(ivec3 cell) {
+    uint h = uint(cell.x * 73856093) ^ uint(cell.y * 19349663) ^ uint(cell.z * 83492791);
+    return h % table_size;
+}
+
+float poly6(float r, float h) {
+    if (r >= h) return 0.0;
+    float diff = h * h - r * r;
+    return poly6_coeff * diff * diff * diff;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= num_particles) return;
+
+    vec3 pos_i = positions[idx].xyz;
+    ivec3 cell_i = ivec3(floor(pos_i / cell_size));
+
+    float density = poly6(0.0, kernel_radius); // self contribution
+
+    for (int dz = -1; dz <= 1; dz++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                ivec3 nc = cell_i + ivec3(dx, dy, dz);
+                uint bucket = hash_cell(nc);
+                uint count = min(cell_count[bucket], max_per_cell);
+
+                for (uint s = 0; s < count; s++) {
+                    uint j = cell_entries[bucket * max_per_cell + s];
+                    if (j == idx) continue;
+                    float r = distance(pos_i, positions[j].xyz);
+                    density += poly6(r, kernel_radius);
+                }
+            }
+        }
+    }
+
+    densities[idx] = density;
+}

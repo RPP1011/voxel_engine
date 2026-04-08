@@ -1,0 +1,41 @@
+#version 450
+layout(local_size_x = 64) in;
+
+struct Body {
+    vec4 pos_mass;   // xyz = position, w = mass
+    vec4 orient;     // quaternion
+    vec4 lin_vel;    // xyz = linear velocity
+    vec4 ang_vel;    // xyz = angular velocity
+    vec4 old_pos;    // xyz = previous position (for velocity derivation)
+    vec4 pad0;
+};
+
+layout(set = 0, binding = 0) buffer Bodies {
+    Body bodies[];
+} body_buf;
+
+layout(set = 0, binding = 1) buffer Params {
+    float dt;
+    float gravity;
+    uint num_bodies;
+    float damping;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.num_bodies) return;
+
+    Body b = body_buf.bodies[idx];
+    if (b.pos_mass.w <= 0.0) return; // static body (mass <= 0)
+
+    // Store old position
+    b.old_pos = b.pos_mass;
+
+    // Apply gravity
+    b.lin_vel.y += params.gravity * params.dt;
+
+    // Predict position
+    b.pos_mass.xyz += b.lin_vel.xyz * params.dt;
+
+    body_buf.bodies[idx] = b;
+}

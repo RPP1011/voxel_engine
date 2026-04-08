@@ -1,0 +1,39 @@
+#version 450
+layout(local_size_x = 64) in;
+
+struct Body {
+    vec4 pos_mass;
+    vec4 orient;
+    vec4 lin_vel;
+    vec4 ang_vel;
+    vec4 old_pos;
+    vec4 pad0;
+};
+
+layout(set = 0, binding = 0) buffer Bodies {
+    Body bodies[];
+} body_buf;
+
+layout(set = 0, binding = 1) buffer Params {
+    float dt;
+    float gravity;
+    uint num_bodies;
+    float ground_y;
+    float body_radius;  // half-extent for ground collision
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.num_bodies) return;
+
+    Body b = body_buf.bodies[idx];
+    if (b.pos_mass.w <= 0.0) return;
+
+    // Ground plane constraint: pos.y - radius >= ground_y
+    float penetration = params.ground_y + params.body_radius - b.pos_mass.y;
+    if (penetration > 0.0) {
+        b.pos_mass.y += penetration; // push out of ground
+    }
+
+    body_buf.bodies[idx] = b;
+}

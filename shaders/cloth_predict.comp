@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer Positions    { vec4 positions[];     };
+layout(set = 0, binding = 1) buffer Velocities   { vec4 velocities[];    };
+layout(set = 0, binding = 2) buffer OldPositions { vec4 old_positions[];  };
+layout(set = 0, binding = 3) buffer Pinned       { uint pinned[];        };
+
+layout(push_constant) uniform PushConstants {
+    uint num_vertices;
+    float dt;
+    float gravity;
+    float _pad;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= num_vertices) return;
+
+    old_positions[idx] = positions[idx];
+
+    if (pinned[idx] != 0) return;
+
+    vec4 vel = velocities[idx];
+    vel.y += gravity * dt;
+    velocities[idx] = vel;
+
+    positions[idx] = vec4(positions[idx].xyz + vel.xyz * dt, 0.0);
+}

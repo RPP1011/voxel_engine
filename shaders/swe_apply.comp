@@ -1,0 +1,48 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) buffer Water     { float water[];      };
+layout(set = 0, binding = 1) buffer FluxRight { float flux_right[];  };
+layout(set = 0, binding = 2) buffer FluxDown  { float flux_down[];   };
+layout(set = 0, binding = 3) buffer Sources   { float sources[];     }; // rate per cell (0 = none)
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    float dt;
+    float _pad;
+};
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint z = gl_GlobalInvocationID.y;
+    if (x >= width || z >= height) return;
+
+    uint i = z * width + x;
+    float delta = 0.0;
+
+    // Outgoing flux from this cell
+    delta -= flux_right[i];
+    delta -= flux_down[i];
+
+    // Incoming flux from left neighbor
+    if (x > 0) {
+        delta += flux_right[z * width + (x - 1)];
+    }
+
+    // Incoming flux from above neighbor
+    if (z > 0) {
+        delta += flux_down[(z - 1) * width + x];
+    }
+
+    water[i] = max(water[i] + delta, 0.0);
+
+    // Apply sources (positive = source, negative = sink rate)
+    float src = sources[i];
+    if (src > 0.0) {
+        water[i] += src * dt;
+    } else if (src < 0.0) {
+        water[i] = max(water[i] + water[i] * src * dt, 0.0);
+    }
+}

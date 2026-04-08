@@ -1,0 +1,86 @@
+#version 450
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+// Full-res voxel grid (read-only storage buffer, flat array)
+layout(set = 0, binding = 0) buffer readonly FullRes {
+    uint full_data[];
+};
+
+// MIP1 output (half-res, write)
+layout(set = 0, binding = 1) buffer writeonly Mip1Out {
+    uint mip1_data[];
+};
+
+// MIP2 output (quarter-res, write)
+layout(set = 0, binding = 2) buffer writeonly Mip2Out {
+    uint mip2_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uvec4 full_dim;    // xyz = full-res dimensions
+    uvec4 mip1_dim;    // xyz = MIP1 dimensions
+    uvec4 mip2_dim;    // xyz = MIP2 dimensions
+    uvec4 region_offset; // xyz = dirty region offset in full-res coords
+    uvec4 region_extent; // xyz = dirty region extent in full-res coords
+} pc;
+
+shared uint block_vals[64]; // 4x4x4 = 64 values
+
+void main() {
+    uvec3 local_id = gl_LocalInvocationID;
+    uvec3 block_id = gl_WorkGroupID;
+
+    // Full-res voxel coordinate
+    uvec3 full_pos = pc.region_offset.xyz + block_id * 4u + local_id;
+
+    // Load voxel value (or 0 if out of bounds)
+    uint val = 0u;
+    if (full_pos.x < pc.full_dim.x && full_pos.y < pc.full_dim.y && full_pos.z < pc.full_dim.z) {
+        uint idx = full_pos.z * pc.full_dim.y * pc.full_dim.x + full_pos.y * pc.full_dim.x + full_pos.x;
+        uint word = full_data[idx / 4u];
+        val = (word >> ((idx % 4u) * 8u)) & 0xFFu;
+    }
+
+    uint local_flat = local_id.z * 16u + local_id.y * 4u + local_id.x;
+    block_vals[local_flat] = val;
+    barrier();
+
+    // MIP1: each 2x2x2 sub-block reduces to one value
+    if ((local_id.x & 1u) == 0u && (local_id.y & 1u) == 0u && (local_id.z & 1u) == 0u) {
+        uint m = 0u;
+        for (uint dz = 0u; dz < 2u; dz++) {
+            for (uint dy = 0u; dy < 2u; dy++) {
+                for (uint dx = 0u; dx < 2u; dx++) {
+                    uint fi = (local_id.z + dz) * 16u + (local_id.y + dy) * 4u + (local_id.x + dx);
+                    m = max(m, block_vals[fi]);
+                }
+            }
+        }
+
+        uvec3 mip1_pos = (pc.region_offset.xyz + block_id * 4u + local_id) / 2u;
+        if (mip1_pos.x < pc.mip1_dim.x && mip1_pos.y < pc.mip1_dim.y && mip1_pos.z < pc.mip1_dim.z) {
+            uint mi = mip1_pos.z * pc.mip1_dim.y * pc.mip1_dim.x + mip1_pos.y * pc.mip1_dim.x + mip1_pos.x;
+            uint word_idx = mi / 4u;
+            uint byte_off = (mi % 4u) * 8u;
+            atomicOr(mip1_data[word_idx], m << byte_off);
+        }
+    }
+    barrier();
+
+    // MIP2: thread (0,0,0) of the workgroup reduces all 64 values
+    if (local_flat == 0u) {
+        uint m = 0u;
+        for (uint i = 0u; i < 64u; i++) {
+            m = max(m, block_vals[i]);
+        }
+
+        uvec3 mip2_pos = (pc.region_offset.xyz / 4u) + block_id;
+        if (mip2_pos.x < pc.mip2_dim.x && mip2_pos.y < pc.mip2_dim.y && mip2_pos.z < pc.mip2_dim.z) {
+            uint mi = mip2_pos.z * pc.mip2_dim.y * pc.mip2_dim.x + mip2_pos.y * pc.mip2_dim.x + mip2_pos.x;
+            uint word_idx = mi / 4u;
+            uint byte_off = (mi % 4u) * 8u;
+            atomicOr(mip2_data[word_idx], m << byte_off);
+        }
+    }
+}

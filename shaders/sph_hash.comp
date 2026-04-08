@@ -1,0 +1,33 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer Positions  { vec4 positions[];   };
+layout(set = 0, binding = 1) buffer CellCount  { uint cell_count[];  };
+layout(set = 0, binding = 2) buffer CellEntries { uint cell_entries[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_particles;
+    float cell_size;
+    uint table_size;
+    uint max_per_cell;
+};
+
+uint hash_cell(ivec3 cell) {
+    uint h = uint(cell.x * 73856093) ^ uint(cell.y * 19349663) ^ uint(cell.z * 83492791);
+    return h % table_size;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= num_particles) return;
+
+    vec3 pos = positions[idx].xyz;
+    ivec3 cell = ivec3(floor(pos / cell_size));
+    uint bucket = hash_cell(cell);
+
+    uint slot = atomicAdd(cell_count[bucket], 1);
+    if (slot < max_per_cell) {
+        cell_entries[bucket * max_per_cell + slot] = idx;
+    }
+}

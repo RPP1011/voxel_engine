@@ -1,0 +1,47 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer Positions        { vec4 positions[];        };
+layout(set = 0, binding = 1) buffer Corrections      { int corrections[];       }; // 3 ints per vertex
+layout(set = 0, binding = 2) buffer CorrectionCounts { uint correction_counts[]; };
+layout(set = 0, binding = 3) buffer Pinned           { uint pinned[];           };
+
+layout(push_constant) uniform PushConstants {
+    uint num_vertices;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+};
+
+const float FP_INV_SCALE = 1.0 / 65536.0;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= num_vertices) return;
+
+    if (pinned[idx] != 0) {
+        corrections[idx * 3 + 0] = 0;
+        corrections[idx * 3 + 1] = 0;
+        corrections[idx * 3 + 2] = 0;
+        correction_counts[idx] = 0;
+        return;
+    }
+
+    uint count = correction_counts[idx];
+    if (count > 0) {
+        float inv = FP_INV_SCALE / float(count);
+        vec3 avg = vec3(
+            float(corrections[idx * 3 + 0]) * inv,
+            float(corrections[idx * 3 + 1]) * inv,
+            float(corrections[idx * 3 + 2]) * inv
+        );
+        positions[idx] = vec4(positions[idx].xyz + avg, 0.0);
+    }
+
+    // Clear for next iteration
+    corrections[idx * 3 + 0] = 0;
+    corrections[idx * 3 + 1] = 0;
+    corrections[idx * 3 + 2] = 0;
+    correction_counts[idx] = 0;
+}

@@ -1,0 +1,58 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer Positions       { vec4 positions[];        };
+layout(set = 0, binding = 1) buffer Corrections     { int corrections[];       }; // 3 ints per vertex (fixed-point xyz)
+layout(set = 0, binding = 2) buffer CorrectionCounts { uint correction_counts[]; };
+layout(set = 0, binding = 3) buffer Constraints     { uvec4 constraints[];     };
+layout(set = 0, binding = 4) buffer Pinned          { uint pinned[];           };
+
+layout(push_constant) uniform PushConstants {
+    uint num_constraints;
+    float stiffness;
+    float _pad0;
+    float _pad1;
+};
+
+// Fixed-point scale: 1.0 = 65536
+const float FP_SCALE = 65536.0;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= num_constraints) return;
+
+    uvec4 c = constraints[idx];
+    uint a = c.x;
+    uint b = c.y;
+    float rest = uintBitsToFloat(c.z);
+
+    vec3 pa = positions[a].xyz;
+    vec3 pb = positions[b].xyz;
+    vec3 diff = pb - pa;
+    float dist = length(diff);
+    if (dist < 1e-6) return;
+
+    float correction = (dist - rest) / dist * stiffness;
+    float wa = (pinned[a] != 0) ? 0.0 : 1.0;
+    float wb = (pinned[b] != 0) ? 0.0 : 1.0;
+    float total = wa + wb;
+    if (total < 1e-6) return;
+
+    vec3 delta = diff * correction;
+
+    if (wa > 0.0) {
+        vec3 ca = delta * (wa / total);
+        atomicAdd(corrections[a * 3 + 0], int(ca.x * FP_SCALE));
+        atomicAdd(corrections[a * 3 + 1], int(ca.y * FP_SCALE));
+        atomicAdd(corrections[a * 3 + 2], int(ca.z * FP_SCALE));
+        atomicAdd(correction_counts[a], 1);
+    }
+    if (wb > 0.0) {
+        vec3 cb = -delta * (wb / total);
+        atomicAdd(corrections[b * 3 + 0], int(cb.x * FP_SCALE));
+        atomicAdd(corrections[b * 3 + 1], int(cb.y * FP_SCALE));
+        atomicAdd(corrections[b * 3 + 2], int(cb.z * FP_SCALE));
+        atomicAdd(correction_counts[b], 1);
+    }
+}

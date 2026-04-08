@@ -1,0 +1,25 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer Positions    { vec4 positions[];    };
+layout(set = 0, binding = 1) buffer OldPositions { vec4 old_positions[]; };
+layout(set = 0, binding = 2) buffer Velocities   { vec4 velocities[];   };
+layout(set = 0, binding = 3) buffer Pinned       { uint pinned[];       };
+
+layout(push_constant) uniform PushConstants {
+    uint num_vertices;
+    float dt;
+    float damping;
+    float _pad;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= num_vertices) return;
+    if (pinned[idx] != 0) return;
+
+    vec3 vel = (positions[idx].xyz - old_positions[idx].xyz) / dt;
+    vel *= damping;
+    velocities[idx] = vec4(vel, 0.0);
+}
