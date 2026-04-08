@@ -1,4 +1,5 @@
 use crate::scene::config::SceneConfig;
+use crate::scene::events::SceneEvent;
 use crate::scene::handle::EntityHandle;
 use crate::scene::transform::Transform;
 use crate::voxel::grid::VoxelGrid;
@@ -18,6 +19,7 @@ pub struct Scene {
     entities: Vec<EntitySlot>,
     free_indices: Vec<u32>,
     config: SceneConfig,
+    event_queue: Vec<SceneEvent>,
 }
 
 impl Scene {
@@ -28,6 +30,7 @@ impl Scene {
             entities: Vec::new(),
             free_indices: Vec::new(),
             config,
+            event_queue: Vec::new(),
         }
     }
 
@@ -103,6 +106,16 @@ impl Scene {
     /// Transform snapshots for interpolation are recorded by `set_transform`.
     pub fn tick_sim(&mut self) {
         // Pending voxel mutations will be flushed here (see task 11).
+    }
+
+    /// Push an event onto the internal event queue.
+    pub fn push_event(&mut self, event: SceneEvent) {
+        self.event_queue.push(event);
+    }
+
+    /// Drain all pending events, clearing the queue.
+    pub fn drain_events(&mut self) -> std::vec::Drain<'_, SceneEvent> {
+        self.event_queue.drain(..)
     }
 
     /// Return an interpolated transform between the previous and current snapshots.
