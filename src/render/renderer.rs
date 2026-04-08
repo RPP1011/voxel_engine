@@ -363,8 +363,8 @@ impl VoxelRenderer {
         objects: &[(&GpuVoxelTexture, [f32; 4], [f32; 3], [f32; 3])],
     ) -> Result<Vec<[u8; 4]>> {
         let aspect = self.width as f32 / self.height as f32;
-        let view = camera.view_matrix();
-        let proj = camera.projection_matrix(aspect);
+        let view = camera.view_matrix_array();
+        let proj = camera.projection_matrix_array(aspect);
         let eye = camera.eye_position();
 
         // Rebuild descriptor sets (textures may have changed even if count hasn't)
@@ -451,10 +451,11 @@ impl VoxelRenderer {
 
         // Pass 4: Deferred sun light pass (descriptor set written once in new())
         let sun_dir = normalize_v([0.5, 0.8, 0.3]);
+        let center = camera.center();
         let view_dir = normalize_v([
-            camera.center[0] - eye[0],
-            camera.center[1] - eye[1],
-            camera.center[2] - eye[2],
+            center.x - eye[0],
+            center.y - eye[1],
+            center.z - eye[2],
         ]);
         let mut light_push = [0u8; 48];
         let sun_dir_v = [sun_dir[0], sun_dir[1], sun_dir[2], 2.0f32]; // w = intensity
@@ -498,8 +499,8 @@ impl VoxelRenderer {
         objects: &[(&GpuVoxelTexture, [f32; 4], [f32; 3], [f32; 3])],
     ) -> Result<()> {
         let aspect = self.width as f32 / self.height as f32;
-        let view = camera.view_matrix();
-        let proj = camera.projection_matrix(aspect);
+        let view = camera.view_matrix_array();
+        let proj = camera.projection_matrix_array(aspect);
         let eye = camera.eye_position();
 
         // Rebuild descriptor sets (textures may have changed even if count hasn't)
@@ -583,10 +584,11 @@ impl VoxelRenderer {
 
         // Pass 4: Deferred sun light pass (descriptor set written once in new())
         let sun_dir = normalize_v([0.5, 0.8, 0.3]);
+        let center = camera.center();
         let view_dir = normalize_v([
-            camera.center[0] - eye[0],
-            camera.center[1] - eye[1],
-            camera.center[2] - eye[2],
+            center.x - eye[0],
+            center.y - eye[1],
+            center.z - eye[2],
         ]);
         let mut light_push = [0u8; 48];
         let sun_dir_v = [sun_dir[0], sun_dir[1], sun_dir[2], 2.0f32];
