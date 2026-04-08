@@ -4,6 +4,13 @@ use crate::scene::handle::EntityHandle;
 use crate::scene::transform::Transform;
 use crate::voxel::grid::VoxelGrid;
 use crate::voxel::material::MaterialPalette;
+use glam::{IVec3, Vec3};
+
+enum VoxelMutation {
+    DamageSphere { handle: EntityHandle, center: Vec3, radius: f32 },
+    DamageBox { handle: EntityHandle, min: Vec3, max: Vec3 },
+    SetVoxel { handle: EntityHandle, pos: IVec3, material: u8 },
+}
 
 pub(crate) struct EntitySlot {
     pub(crate) generation: u32,
@@ -20,6 +27,7 @@ pub struct Scene {
     free_indices: Vec<u32>,
     config: SceneConfig,
     event_queue: Vec<SceneEvent>,
+    pending_mutations: Vec<VoxelMutation>,
 }
 
 impl Scene {
@@ -31,6 +39,7 @@ impl Scene {
             free_indices: Vec::new(),
             config,
             event_queue: Vec::new(),
+            pending_mutations: Vec::new(),
         }
     }
 
@@ -102,10 +111,79 @@ impl Scene {
     }
 
     /// Advance one simulation tick.
-    /// Applies any pending voxel mutations.
+    /// Flushes pending voxel mutations, then runs any simulation logic.
     /// Transform snapshots for interpolation are recorded by `set_transform`.
     pub fn tick_sim(&mut self) {
-        // Pending voxel mutations will be flushed here (see task 11).
+        let mutations = std::mem::take(&mut self.pending_mutations);
+        for mutation in mutations {
+            self.apply_mutation(mutation);
+        }
+    }
+
+    fn apply_mutation(&mut self, mutation: VoxelMutation) {
+        match mutation {
+            VoxelMutation::DamageSphere { handle, center, radius } => {
+                if let Some(slot) = self.entities.get_mut(handle.index as usize) {
+                    if slot.generation == handle.generation && slot.alive {
+                        crate::voxel::destruction::remove_sphere(
+                            &mut slot.grid,
+                            (center.x as u32, center.y as u32, center.z as u32),
+                            radius,
+                        );
+                    }
+                }
+            }
+            VoxelMutation::DamageBox { handle, min, max } => {
+                if let Some(slot) = self.entities.get_mut(handle.index as usize) {
+                    if slot.generation == handle.generation && slot.alive {
+                        crate::voxel::destruction::remove_box(
+                            &mut slot.grid,
+                            (min.x as u32, min.y as u32, min.z as u32),
+                            (max.x as u32, max.y as u32, max.z as u32),
+                        );
+                    }
+                }
+            }
+            VoxelMutation::SetVoxel { handle, pos, material } => {
+                if let Some(slot) = self.entities.get_mut(handle.index as usize) {
+                    if slot.generation == handle.generation && slot.alive {
+                        slot.grid.set(pos.x as u32, pos.y as u32, pos.z as u32, material);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Queue a sphere damage mutation to be applied on the next `tick_sim`.
+    /// Silently ignores dead or invalid handles.
+    pub fn damage_sphere(&mut self, handle: EntityHandle, center: Vec3, radius: f32) {
+        if self.is_alive(handle) {
+            self.pending_mutations.push(VoxelMutation::DamageSphere { handle, center, radius });
+        }
+    }
+
+    /// Queue a box damage mutation to be applied on the next `tick_sim`.
+    /// Silently ignores dead or invalid handles.
+    pub fn damage_box(&mut self, handle: EntityHandle, min: Vec3, max: Vec3) {
+        if self.is_alive(handle) {
+            self.pending_mutations.push(VoxelMutation::DamageBox { handle, min, max });
+        }
+    }
+
+    /// Queue a single-voxel set mutation to be applied on the next `tick_sim`.
+    /// Silently ignores dead or invalid handles.
+    pub fn set_voxel(&mut self, handle: EntityHandle, pos: IVec3, material: u8) {
+        if self.is_alive(handle) {
+            self.pending_mutations.push(VoxelMutation::SetVoxel { handle, pos, material });
+        }
+    }
+
+    /// Return the number of non-empty voxels in the entity's grid, or `None` if dead.
+    pub fn voxel_count(&self, handle: EntityHandle) -> Option<usize> {
+        self.entities
+            .get(handle.index as usize)
+            .filter(|s| s.generation == handle.generation && s.alive)
+            .map(|s| s.grid.count_nonempty())
     }
 
     /// Push an event onto the internal event queue.
