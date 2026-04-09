@@ -25,8 +25,15 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     vec3 dim = pc.grid_dim.xyz;
-    vec3 entry = clamp(frag_entry_pos, vec3(0.001), dim - vec3(0.001));
-    vec3 ray_dir = normalize(entry - frag_camera_pos);
+    // If camera is inside the volume (back-face hit), start ray from camera position.
+    bool camera_inside = all(greaterThanEqual(frag_camera_pos, vec3(0.0)))
+                      && all(lessThan(frag_camera_pos, dim));
+    vec3 entry = camera_inside
+        ? clamp(frag_camera_pos, vec3(0.001), dim - vec3(0.001))
+        : clamp(frag_entry_pos, vec3(0.001), dim - vec3(0.001));
+    vec3 ray_dir = camera_inside
+        ? normalize(frag_entry_pos - frag_camera_pos)
+        : normalize(entry - frag_camera_pos);
 
     ivec3 pos = ivec3(floor(entry));
     ivec3 step_dir = ivec3(sign(ray_dir));
