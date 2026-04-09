@@ -9,6 +9,30 @@ use crate::vulkan::shadow_map::ShadowMap;
 use crate::vulkan::voxel_gpu::GpuVoxelTexture;
 
 use crate::camera::OrbitCamera;
+use crate::camera::FreeCamera;
+use glam::Vec3;
+
+/// Trait for cameras compatible with the renderer.
+pub trait RenderCamera {
+    fn eye_position(&self) -> [f32; 3];
+    fn view_matrix_array(&self) -> [f32; 16];
+    fn projection_matrix_array(&self, aspect: f32) -> [f32; 16];
+    fn center(&self) -> Vec3;
+}
+
+impl RenderCamera for OrbitCamera {
+    fn eye_position(&self) -> [f32; 3] { self.eye_position() }
+    fn view_matrix_array(&self) -> [f32; 16] { self.view_matrix_array() }
+    fn projection_matrix_array(&self, aspect: f32) -> [f32; 16] { self.projection_matrix_array(aspect) }
+    fn center(&self) -> Vec3 { self.center() }
+}
+
+impl RenderCamera for FreeCamera {
+    fn eye_position(&self) -> [f32; 3] { self.eye_position() }
+    fn view_matrix_array(&self) -> [f32; 16] { self.view_matrix_array() }
+    fn projection_matrix_array(&self, aspect: f32) -> [f32; 16] { self.projection_matrix_array(aspect) }
+    fn center(&self) -> Vec3 { self.center() }
+}
 
 /// Full rendering pipeline orchestrator.
 /// Owns GBuffer, ShadowMap, offscreen targets, all pipelines, samplers, and descriptor pools.
@@ -85,6 +109,7 @@ impl VoxelRenderer {
             .descriptor(2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, vk::ShaderStageFlags::FRAGMENT)
             .descriptor(3, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, vk::ShaderStageFlags::FRAGMENT)
             .color_attachment_count(5)
+            .cull_mode(vk::CullModeFlags::NONE) // allow camera inside voxel volumes
             .build()?;
 
         // Build shadow pipeline (reuses gbuffer.vert + shadow_map.frag)
@@ -359,7 +384,7 @@ impl VoxelRenderer {
     pub fn render_frame(
         &mut self,
         ctx: &VulkanContext,
-        camera: &OrbitCamera,
+        camera: &impl RenderCamera,
         objects: &[(&GpuVoxelTexture, [f32; 4], [f32; 3], [f32; 3])],
     ) -> Result<Vec<[u8; 4]>> {
         let aspect = self.width as f32 / self.height as f32;
@@ -495,7 +520,7 @@ impl VoxelRenderer {
     pub fn render_frame_gpu(
         &mut self,
         ctx: &VulkanContext,
-        camera: &OrbitCamera,
+        camera: &impl RenderCamera,
         objects: &[(&GpuVoxelTexture, [f32; 4], [f32; 3], [f32; 3])],
     ) -> Result<()> {
         let aspect = self.width as f32 / self.height as f32;

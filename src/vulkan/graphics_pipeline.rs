@@ -46,6 +46,7 @@ pub struct GraphicsPipelineBuilder<'a> {
     depth_test: bool,
     color_attachment_count: u32,
     no_vertex_input: bool,
+    cull_mode: vk::CullModeFlags,
 }
 
 impl<'a> GraphicsPipelineBuilder<'a> {
@@ -62,6 +63,7 @@ impl<'a> GraphicsPipelineBuilder<'a> {
             depth_test: true,
             color_attachment_count: 1,
             no_vertex_input: false,
+            cull_mode: vk::CullModeFlags::BACK,
         }
     }
 
@@ -110,6 +112,11 @@ impl<'a> GraphicsPipelineBuilder<'a> {
         self
     }
 
+    pub fn cull_mode(mut self, mode: vk::CullModeFlags) -> Self {
+        self.cull_mode = mode;
+        self
+    }
+
     pub fn no_depth_test(mut self) -> Self {
         self.depth_test = false;
         self.depth_write = false;
@@ -154,7 +161,7 @@ impl<'a> GraphicsPipelineBuilder<'a> {
             .viewport_count(1).scissor_count(1);
         let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::BACK)
+            .cull_mode(self.cull_mode)
             .front_face(vk::FrontFace::CLOCKWISE)
             .line_width(1.0);
         let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
