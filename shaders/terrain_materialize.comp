@@ -1,0 +1,69 @@
+#version 450
+
+// Helpers inlined (would be terrain_common.glsl but build.rs doesn't configure includes).
+// Mirrors src/world_sim/terrain/noise.rs::hash_u32 byte-for-byte.
+
+uint hash_u32(int x, int y, int z, uint seed) {
+    uint h = seed + 0x9e3779b9u;
+    h = (h + uint(x)) * 0x9e3779b9u;
+    h = (h + uint(y)) * 0x85ebca6bu;
+    h = (h + uint(z)) * 0xc2b2ae35u;
+    // Murmur3 fmix32 finalizer
+    h ^= h >> 16;
+    h = h * 0x85ebca6bu;
+    h ^= h >> 13;
+    h = h * 0xc2b2ae35u;
+    h ^= h >> 16;
+    return h;
+}
+
+float hash_f32(int x, int y, int z, uint seed) {
+    return float(hash_u32(x, y, z, seed)) / 4294967295.0;
+}
+
+// One invocation per 4-voxel x-strip. With cs=64, x dim = 16 strips.
+// Local size: 16 × 8 × 8 = 1024 (max for most GPUs).
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 8) in;
+
+// Output: u8 material per voxel, packed into uint storage buffer (4 voxels per uint).
+layout(set = 0, binding = 0) buffer OutputBuf {
+    uint voxels[]; // length = chunk_size^3 / 4
+} out_buf;
+
+layout(push_constant) uniform PushConstants {
+    ivec4 chunk_pos;       // (cx, cy, cz, _)
+    uvec4 params;          // (seed, chunk_size, _, _)
+} pc;
+
+const uint MAT_AIR   = 0u;
+const uint MAT_STONE = 2u;
+
+uint material_at(int vx, int vy, int vz, uint seed) {
+    // SKELETON: stone below z=0, air above. Real materializer comes in Task 6.
+    return (vz < 0) ? MAT_STONE : MAT_AIR;
+}
+
+void main() {
+    uint cs       = pc.params.y;
+    uint cs_words = cs / 4u; // x dimension divided into 4-voxel strips
+
+    uvec3 lp = gl_GlobalInvocationID;
+    if (lp.x >= cs_words || lp.y >= cs || lp.z >= cs) return;
+
+    uint seed  = pc.params.x;
+    int base_x = pc.chunk_pos.x * int(cs) + int(lp.x) * 4;
+    int vy     = pc.chunk_pos.y * int(cs) + int(lp.y);
+    int vz     = pc.chunk_pos.z * int(cs) + int(lp.z);
+
+    // Each invocation owns 4 consecutive x-voxels → one full uint word (no RMW race).
+    uint m0 = material_at(base_x + 0, vy, vz, seed);
+    uint m1 = material_at(base_x + 1, vy, vz, seed);
+    uint m2 = material_at(base_x + 2, vy, vz, seed);
+    uint m3 = material_at(base_x + 3, vy, vz, seed);
+
+    uint packed = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24);
+
+    // word_idx: stride in x is cs/4 words; y and z use full cs stride.
+    uint word_idx = (lp.z * cs * cs + lp.y * cs) / 4u + lp.x;
+    out_buf.voxels[word_idx] = packed;
+}
