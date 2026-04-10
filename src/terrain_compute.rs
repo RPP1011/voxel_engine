@@ -40,6 +40,28 @@ pub struct RegionPlanHeader {
     pub _pad: u32,
 }
 
+/// GPU layout of a single river polyline point. Mirrors the GLSL
+/// `RiverPoint` struct. std430: 16 bytes (vec4-aligned).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RiverPointGpu {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub _pad: f32,
+}
+
+/// GPU header describing a river's range in the flat points buffer.
+/// Mirrors the GLSL `RiverHeader` struct. std430: 16 bytes (uvec4-aligned).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RiverHeaderGpu {
+    pub start_idx: u32,
+    pub length: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
 pub struct TerrainComputePipeline {
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
@@ -51,6 +73,10 @@ pub struct TerrainComputePipeline {
     region_header_buffer: Option<AllocatedBuffer>,
     placeholder_cells_buffer: AllocatedBuffer,
     placeholder_header_buffer: AllocatedBuffer,
+    river_points_buffer: Option<AllocatedBuffer>,
+    river_headers_buffer: Option<AllocatedBuffer>,
+    placeholder_river_points: AllocatedBuffer,
+    placeholder_river_headers: AllocatedBuffer,
     shader_module: vk::ShaderModule,
 }
 
@@ -71,10 +97,12 @@ impl TerrainComputePipeline {
         let shader_module = unsafe { device.create_shader_module(&shader_ci, None) }
             .context("create terrain compute shader")?;
 
-        // Descriptor layout: three STORAGE_BUFFER bindings.
+        // Descriptor layout: five STORAGE_BUFFER bindings.
         //   binding 0 = output voxel buffer
         //   binding 1 = region plan cells
         //   binding 2 = region plan header
+        //   binding 3 = river points (flat)
+        //   binding 4 = river headers (per-polyline ranges)
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -88,6 +116,16 @@ impl TerrainComputePipeline {
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
@@ -124,10 +162,10 @@ impl TerrainComputePipeline {
         .map_err(|(_, e)| e)
         .context("compute pipeline")?[0];
 
-        // Descriptor pool with three storage buffer descriptors.
+        // Descriptor pool with five storage buffer descriptors.
         let pool_size = vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(3);
+            .descriptor_count(5);
         let pool_sizes = [pool_size];
         let pool_ci = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
@@ -193,7 +231,49 @@ impl TerrainComputePipeline {
             .write_data(0, zero_header_bytes)
             .context("write placeholder header")?;
 
-        // Bind all three buffers to the descriptor set.
+        // Placeholder river buffers. We allocate 1 dummy point and 1 dummy
+        // header with length=0 so iteration is a no-op if upload_rivers
+        // is never called.
+        let mut placeholder_river_points = alloc
+            .allocate_host_visible_buffer(std::mem::size_of::<RiverPointGpu>() as u64)
+            .context("placeholder river points buffer")?;
+        let zero_river_pt = RiverPointGpu {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            _pad: 0.0,
+        };
+        let zero_river_pt_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &zero_river_pt as *const _ as *const u8,
+                std::mem::size_of::<RiverPointGpu>(),
+            )
+        };
+        placeholder_river_points
+            .write_data(0, zero_river_pt_bytes)
+            .context("write placeholder river point")?;
+
+        let mut placeholder_river_headers = alloc
+            .allocate_host_visible_buffer(std::mem::size_of::<RiverHeaderGpu>() as u64)
+            .context("placeholder river headers buffer")?;
+        // length=0 so the shader's inner loop never runs for this dummy.
+        let zero_river_hdr = RiverHeaderGpu {
+            start_idx: 0,
+            length: 0,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let zero_river_hdr_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &zero_river_hdr as *const _ as *const u8,
+                std::mem::size_of::<RiverHeaderGpu>(),
+            )
+        };
+        placeholder_river_headers
+            .write_data(0, zero_river_hdr_bytes)
+            .context("write placeholder river header")?;
+
+        // Bind all five buffers to the descriptor set.
         let output_info = [vk::DescriptorBufferInfo::default()
             .buffer(output_buffer.buffer())
             .offset(0)
@@ -206,6 +286,14 @@ impl TerrainComputePipeline {
             .buffer(placeholder_header_buffer.buffer())
             .offset(0)
             .range(std::mem::size_of::<RegionPlanHeader>() as u64)];
+        let river_points_info = [vk::DescriptorBufferInfo::default()
+            .buffer(placeholder_river_points.buffer())
+            .offset(0)
+            .range(std::mem::size_of::<RiverPointGpu>() as u64)];
+        let river_headers_info = [vk::DescriptorBufferInfo::default()
+            .buffer(placeholder_river_headers.buffer())
+            .offset(0)
+            .range(std::mem::size_of::<RiverHeaderGpu>() as u64)];
         let writes = [
             vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
@@ -222,6 +310,16 @@ impl TerrainComputePipeline {
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&header_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&river_points_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&river_headers_info),
         ];
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
@@ -236,6 +334,10 @@ impl TerrainComputePipeline {
             region_header_buffer: None,
             placeholder_cells_buffer,
             placeholder_header_buffer,
+            river_points_buffer: None,
+            river_headers_buffer: None,
+            placeholder_river_points,
+            placeholder_river_headers,
             shader_module,
         })
     }
@@ -330,6 +432,112 @@ impl TerrainComputePipeline {
 
         self.region_cells_buffer = Some(cells_buf);
         self.region_header_buffer = Some(header_buf);
+        Ok(())
+    }
+
+    /// Upload (or re-upload) the river polylines to GPU storage buffers and
+    /// update the descriptor set bindings 3/4 to point at them.
+    ///
+    /// If `points` or `headers` is empty, a single dummy entry is uploaded
+    /// (length=0 header) so the shader inner loop simply does nothing.
+    pub fn upload_rivers(
+        &mut self,
+        ctx: &VulkanContext,
+        alloc: &mut VulkanAllocator,
+        points: &[RiverPointGpu],
+        headers: &[RiverHeaderGpu],
+    ) -> Result<()> {
+        // 1. Free any previously-uploaded buffers.
+        if let Some(old) = self.river_points_buffer.take() {
+            alloc.free_buffer(old);
+        }
+        if let Some(old) = self.river_headers_buffer.take() {
+            alloc.free_buffer(old);
+        }
+
+        // 2. Decide what we're uploading. Always upload at least one dummy
+        //    entry to keep the descriptor range > 0 (empty buffers are not
+        //    allowed by the allocator).
+        let use_dummy = points.is_empty() || headers.is_empty();
+        let (points_slice, headers_slice);
+        let dummy_pt = [RiverPointGpu {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            _pad: 0.0,
+        }];
+        let dummy_hdr = [RiverHeaderGpu {
+            start_idx: 0,
+            length: 0,
+            _pad0: 0,
+            _pad1: 0,
+        }];
+        if use_dummy {
+            points_slice = &dummy_pt[..];
+            headers_slice = &dummy_hdr[..];
+        } else {
+            points_slice = points;
+            headers_slice = headers;
+        }
+
+        // 3. Allocate + fill points buffer.
+        let points_size =
+            (points_slice.len() * std::mem::size_of::<RiverPointGpu>()) as u64;
+        let mut points_buf = alloc
+            .allocate_host_visible_buffer(points_size)
+            .context("river points buffer")?;
+        let points_bytes = unsafe {
+            std::slice::from_raw_parts(
+                points_slice.as_ptr() as *const u8,
+                points_size as usize,
+            )
+        };
+        points_buf
+            .write_data(0, points_bytes)
+            .context("write river points")?;
+
+        // 4. Allocate + fill headers buffer.
+        let headers_size =
+            (headers_slice.len() * std::mem::size_of::<RiverHeaderGpu>()) as u64;
+        let mut headers_buf = alloc
+            .allocate_host_visible_buffer(headers_size)
+            .context("river headers buffer")?;
+        let headers_bytes = unsafe {
+            std::slice::from_raw_parts(
+                headers_slice.as_ptr() as *const u8,
+                headers_size as usize,
+            )
+        };
+        headers_buf
+            .write_data(0, headers_bytes)
+            .context("write river headers")?;
+
+        // 5. Update descriptor set bindings 3 and 4.
+        let device = ctx.device();
+        let points_info = [vk::DescriptorBufferInfo::default()
+            .buffer(points_buf.buffer())
+            .offset(0)
+            .range(points_size)];
+        let headers_info = [vk::DescriptorBufferInfo::default()
+            .buffer(headers_buf.buffer())
+            .offset(0)
+            .range(headers_size)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&points_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&headers_info),
+        ];
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+
+        self.river_points_buffer = Some(points_buf);
+        self.river_headers_buffer = Some(headers_buf);
         Ok(())
     }
 
@@ -438,10 +646,18 @@ impl TerrainComputePipeline {
         alloc.free_buffer(self.output_buffer);
         alloc.free_buffer(self.placeholder_cells_buffer);
         alloc.free_buffer(self.placeholder_header_buffer);
+        alloc.free_buffer(self.placeholder_river_points);
+        alloc.free_buffer(self.placeholder_river_headers);
         if let Some(b) = self.region_cells_buffer {
             alloc.free_buffer(b);
         }
         if let Some(b) = self.region_header_buffer {
+            alloc.free_buffer(b);
+        }
+        if let Some(b) = self.river_points_buffer {
+            alloc.free_buffer(b);
+        }
+        if let Some(b) = self.river_headers_buffer {
             alloc.free_buffer(b);
         }
     }

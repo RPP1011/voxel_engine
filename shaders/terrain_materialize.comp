@@ -172,6 +172,29 @@ layout(set = 0, binding = 2) readonly buffer RegionHeaderBuf {
     uint _pad;
 } header;
 
+// River polylines — std430 layout, must match Rust RiverPointGpu / RiverHeaderGpu.
+struct RiverPoint {
+    float x;
+    float y;
+    float width;
+    float _pad;
+};
+
+struct RiverHeader {
+    uint start_idx;
+    uint count;
+    uint _pad0;
+    uint _pad1;
+};
+
+layout(set = 0, binding = 3) readonly buffer RiverPointsBuf {
+    RiverPoint points[];
+} river_points;
+
+layout(set = 0, binding = 4) readonly buffer RiverHeadersBuf {
+    RiverHeader headers[];
+} river_headers;
+
 // Sample the nearest region cell for a voxel (vx, vy) position.
 RegionCell sample_cell(float vx, float vy) {
     int col = clamp(int(floor(vx / float(header.cell_size))), 0, int(header.cols) - 1);
@@ -454,6 +477,91 @@ uint cave_override(int vx, int vy, int vz, int lz, uint base_mat,
     return fill_id;
 }
 
+// ---------------------------------------------------------------------------
+// River carving — mirrors Rust terrain/rivers.rs.
+// ---------------------------------------------------------------------------
+
+float segment_closest_t(float px, float py, float ax, float ay, float bx, float by) {
+    float dx = bx - ax;
+    float dy = by - ay;
+    float len2 = dx * dx + dy * dy;
+    if (len2 < 1e-6) return 0.0;
+    return ((px - ax) * dx + (py - ay) * dy) / len2;
+}
+
+// Walk all river polylines and return vec2(closest_dist, interpolated_width)
+// for the nearest segment to (px, py). Returns dist=1e10 if no rivers.
+vec2 closest_river_distance(float px, float py) {
+    float best_dist = 1e10;
+    float best_width = 1.0;
+    uint n_rivers = river_headers.headers.length();
+    for (uint r = 0u; r < n_rivers; r++) {
+        RiverHeader hdr = river_headers.headers[r];
+        if (hdr.count < 2u) continue;
+        uint segs = hdr.count - 1u;
+        for (uint i = 0u; i < segs; i++) {
+            RiverPoint a = river_points.points[hdr.start_idx + i];
+            RiverPoint b = river_points.points[hdr.start_idx + i + 1u];
+            float t = clamp(segment_closest_t(px, py, a.x, a.y, b.x, b.y), 0.0, 1.0);
+            float cx = a.x + (b.x - a.x) * t;
+            float cy = a.y + (b.y - a.y) * t;
+            float dx = px - cx;
+            float dy = py - cy;
+            float dist = sqrt(dx * dx + dy * dy);
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_width = a.width + (b.width - a.width) * t;
+            }
+        }
+    }
+    return vec2(best_dist, best_width);
+}
+
+// Apply river carving to a single voxel. Returns the new material, or
+// 0xFFFFFFFFu if no river override applies. Mirrors Rust
+// carve_river_in_chunk per-voxel logic (no state between voxels).
+uint river_override(int vx, int vy, int vz, uint base_mat, uint seed) {
+    // Never carve Granite.
+    if (base_mat == MAT_GRANITE) return 0xFFFFFFFFu;
+
+    vec2 rd = closest_river_distance(float(vx), float(vy));
+    float dist = rd.x;
+    float width = rd.y;
+    if (dist >= width) return 0xFFFFFFFFu;
+
+    int surface_z_river = surface_height_at(float(vx), float(vy), seed);
+    int bed_depth = max(int(width * 0.3), 2);
+    int river_surface_z = surface_z_river;
+    int river_bed_z = river_surface_z - bed_depth;
+    float dist_ratio = dist / width;
+
+    if (dist_ratio < 0.4) {
+        // Center channel
+        if (vz <= river_surface_z && vz >= river_bed_z) {
+            int midpoint = (river_bed_z + river_surface_z) / 2;
+            return (vz <= midpoint) ? MAT_WATER : MAT_AIR;
+        } else if (vz > river_surface_z && vz <= river_surface_z + 1) {
+            // One voxel above surface: carve open top if base is solid.
+            // is_solid is false for Air, Water, Lava — mirror the Rust check.
+            if (base_mat != MAT_AIR && base_mat != MAT_WATER && base_mat != MAT_LAVA) {
+                return MAT_AIR;
+            }
+        }
+    } else if (dist_ratio < 0.7) {
+        // Bank zone — gradual slope: carve top few voxels to Air.
+        float bank_t = (dist_ratio - 0.4) / 0.3;
+        int carve_depth = int((1.0 - bank_t) * float(bed_depth) * 0.5);
+        int bank_top = river_surface_z;
+        int bank_bot = river_surface_z - carve_depth;
+        if (vz <= bank_top && vz >= bank_bot) {
+            if (base_mat != MAT_AIR && base_mat != MAT_WATER && base_mat != MAT_LAVA) {
+                return MAT_AIR;
+            }
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
 uint material_at(int vx, int vy, int vz, uint seed) {
     RegionCell cell = sample_cell(float(vx), float(vy));
     uint terrain = cell.terrain;
@@ -629,6 +737,19 @@ void main() {
         if (o1 != 0xFFFFFFFFu) m1 = o1;
         if (o2 != 0xFFFFFFFFu) m2 = o2;
         if (o3 != 0xFFFFFFFFu) m3 = o3;
+    }
+
+    // River carving post-pass — runs AFTER caves so caves take priority
+    // underground. Iterates all uploaded river polylines per voxel.
+    {
+        uint r0 = river_override(base_x + 0, vy, vz, m0, seed);
+        uint r1 = river_override(base_x + 1, vy, vz, m1, seed);
+        uint r2 = river_override(base_x + 2, vy, vz, m2, seed);
+        uint r3 = river_override(base_x + 3, vy, vz, m3, seed);
+        if (r0 != 0xFFFFFFFFu) m0 = r0;
+        if (r1 != 0xFFFFFFFFu) m1 = r1;
+        if (r2 != 0xFFFFFFFFu) m2 = r2;
+        if (r3 != 0xFFFFFFFFu) m3 = r3;
     }
 
     uint packed = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24);
