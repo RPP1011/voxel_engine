@@ -765,26 +765,14 @@ uint try_pillar_at(int ox, int oy, int vx, int vy, int vz, int feature_base_z,
     return fp.pillar_material;
 }
 
-// Apply surface feature overrides for (vx,vy,vz) using chunk-center biome.
-// Returns the new material, or base_mat if no feature applies.
+// Apply surface feature overrides for (vx,vy,vz) by scanning origin columns
+// in a halo around this chunk. Each origin samples its own biome (matches
+// CPU halo stamping in features.rs::place_surface_features).
 uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
     int cs = int(pc.params.y);
     int base_x = pc.chunk_pos.x * cs;
     int base_y = pc.chunk_pos.y * cs;
     int base_z = pc.chunk_pos.z * cs;
-
-    // Chunk-center biome — CPU uses chunk-center cell, not per-voxel.
-    int ccx = base_x + cs / 2;
-    int ccy = base_y + cs / 2;
-    RegionCell center_cell = sample_cell(float(ccx), float(ccy));
-    int center_surface_z = surface_height_at(float(ccx), float(ccy), seed);
-    int surface_z_local = center_surface_z - base_z;
-    if (surface_z_local < -10 || surface_z_local >= cs + 10) return base_mat;
-
-    FeatureParams fp = feature_params(center_cell.terrain, center_cell.sub_biome);
-    if (fp.tree_density == 0.0 && fp.boulder_density == 0.0 && fp.pillar_density == 0.0) {
-        return base_mat;
-    }
 
     // Early-out: skip voxels far from this voxel's own surface. Features sit
     // 1 voxel above the per-column surface with max vertical reach ~160.
@@ -793,16 +781,17 @@ uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
         return base_mat;
     }
 
-    // Restrict column search to a bounding box of max feature radius. This is
-    // a conservative radius; the inner per-feature tests still enforce exact
-    // shape. Clip to chunk bounds (CPU only stamps from in-chunk origins).
+    // Scan a halo around this voxel for origin columns whose feature
+    // footprint could reach (vx,vy,vz). No clipping to chunk bounds — origin
+    // columns in neighbor chunks contribute trunk/canopy voxels that cross
+    // into this chunk.
     int vlx = vx - base_x;
     int vly = vy - base_y;
     int rmax = 30; // max tree canopy radius
-    int olx_min = max(0, vlx - rmax);
-    int olx_max = min(cs - 1, vlx + rmax);
-    int oly_min = max(0, vly - rmax);
-    int oly_max = min(cs - 1, vly + rmax);
+    int olx_min = vlx - rmax;
+    int olx_max = vlx + rmax;
+    int oly_min = vly - rmax;
+    int oly_max = vly + rmax;
 
     uint mat = base_mat;
     bool mat_is_trunk = false; // track if current mat came from a trunk voxel
@@ -817,12 +806,20 @@ uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
             int d2 = dx * dx + dy * dy;
             if (d2 > FEATURE_MAX_RADIUS_SQ) continue;
 
+            // Sample cell AT this origin — the origin may be in a neighbor
+            // chunk with a different biome (matches CPU per-origin sampling).
+            RegionCell origin_cell = sample_cell(float(ox), float(oy));
+            FeatureParams fp = feature_params(origin_cell.terrain, origin_cell.sub_biome);
+            if (fp.tree_density == 0.0 && fp.boulder_density == 0.0 && fp.pillar_density == 0.0) continue;
+
             // Per-column surface (expensive FBM call).
             int col_surface_z = surface_height_at(float(ox), float(oy), seed);
             int feature_base_z = col_surface_z + 1;
-            int local_z = feature_base_z - base_z;
-            // CPU skips columns whose feature base isn't in this chunk.
-            if (local_z < 0 || local_z >= cs) continue;
+
+            // Early-out: if the feature's vertical extent can't reach this
+            // chunk, skip. No local_z clip — feature may span multiple chunks.
+            if (feature_base_z + FEATURE_MAX_Z_ABOVE < base_z ||
+                feature_base_z - 1 >= base_z + cs) continue;
 
             // Trees first (CPU order).
             if (fp.tree_density > 0.0) {
