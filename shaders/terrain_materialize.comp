@@ -21,6 +21,68 @@ float hash_f32(int x, int y, int z, uint seed) {
     return float(hash_u32(x, y, z, seed)) / 4294967295.0;
 }
 
+// --- 64-bit arithmetic helpers for hash_3d (u64 path) -----------------------
+// Mirrors Rust noise.rs::hash_3d which uses u64 arithmetic. We emulate u64
+// as uvec2(hi, lo). Needed because materialize.rs calls noise::hash_f32
+// (the u64-based hash_3d), not the u32 Murmur3 path used by fbm_2d.
+
+uvec2 u64_add(uvec2 a, uvec2 b) {
+    uint lo = a.y + b.y;
+    uint carry = (lo < a.y) ? 1u : 0u;
+    uint hi = a.x + b.x + carry;
+    return uvec2(hi, lo);
+}
+
+// Low 64 bits of (a * b). Uses umulExtended for 32x32->64 partial products.
+uvec2 u64_mul(uvec2 a, uvec2 b) {
+    uint ll_hi, ll_lo;
+    umulExtended(a.y, b.y, ll_hi, ll_lo);  // a_lo * b_lo (full 64)
+    uint lh_lo = a.y * b.x;                 // low(a_lo * b_hi)
+    uint hl_lo = a.x * b.y;                 // low(a_hi * b_lo)
+    uint out_lo = ll_lo;
+    uint out_hi = ll_hi + lh_lo + hl_lo;
+    return uvec2(out_hi, out_lo);
+}
+
+// Logical shift right by 33 (only case used in hash_3d).
+uvec2 u64_shr33(uvec2 a) {
+    return uvec2(0u, a.x >> 1u);
+}
+
+uvec2 u64_xor(uvec2 a, uvec2 b) {
+    return uvec2(a.x ^ b.x, a.y ^ b.y);
+}
+
+// Sign-extend i32 to u64 (matches Rust `x as u64` for signed x).
+uvec2 i32_to_u64(int x) {
+    uint lo = uint(x);
+    uint hi = (x < 0) ? 0xFFFFFFFFu : 0u;
+    return uvec2(hi, lo);
+}
+
+// Mirrors Rust noise.rs::hash_3d. Multiplier 0x5851F42D4C957F2D,
+// fmix constant 0xFF51AFD7ED558CCD. Returns high 32 bits (h >> 32 as u32).
+uint hash_3d_u64(int x, int y, int z, uvec2 seed) {
+    const uvec2 K1 = uvec2(0x5851F42Du, 0x4C957F2Du);
+    const uvec2 K2 = uvec2(0xFF51AFD7u, 0xED558CCDu);
+    uvec2 h = seed;
+    h = u64_add(u64_mul(h, K1), i32_to_u64(x));
+    h = u64_add(u64_mul(h, K1), i32_to_u64(y));
+    h = u64_add(u64_mul(h, K1), i32_to_u64(z));
+    h = u64_xor(h, u64_shr33(h));
+    h = u64_mul(h, K2);
+    h = u64_xor(h, u64_shr33(h));
+    return h.x; // (h >> 32) as u32
+}
+
+// Mirrors Rust noise.rs::hash_f32 (the u64-seed version). Called from
+// materialize.rs for ore veins and surface variation. The `seed` parameter
+// is a u32; we zero-extend to u64 (since the parity test seed fits in u32).
+float hash_f32_u64(int x, int y, int z, uint seed) {
+    uvec2 s = uvec2(0u, seed);
+    return float(hash_3d_u64(x, y, z, s)) / 4294967295.0;
+}
+
 float smoothstep_t(float t) {
     return t * t * (3.0 - 2.0 * t);
 }
@@ -178,23 +240,173 @@ const uint MAT_STONE   = 2u;
 const uint MAT_GRANITE = 3u;
 const uint MAT_GRASS   = 7u;
 
+const int SEA_LEVEL = 350;
+
+// Returns (surface_mat, subsoil_mat, deep_stone_mat) packed into uvec3.
+// Mirrors Rust biome.rs::surface_materials.
+uvec3 surface_materials(uint terrain) {
+    if (terrain == 0u)  return uvec3(41u, 1u, 2u);   // Plains: TallGrass, Dirt, Stone
+    if (terrain == 1u)  return uvec3(7u, 1u, 2u);    // Forest: Grass, Dirt, Stone
+    if (terrain == 9u)  return uvec3(37u, 5u, 2u);   // Jungle: JungleMoss, Clay, Stone
+    if (terrain == 5u)  return uvec3(4u, 27u, 2u);   // Desert: Sand, Sandstone, Stone
+    if (terrain == 12u) return uvec3(39u, 27u, 3u);  // Badlands: RedSand, Sandstone, Granite
+    if (terrain == 2u)  return uvec3(2u, 2u, 3u);    // Mountains: Stone, Stone, Granite
+    if (terrain == 6u)  return uvec3(40u, 6u, 2u);   // Tundra: Peat, Gravel, Stone
+    if (terrain == 10u) return uvec3(11u, 10u, 2u);  // Glacier: Snow, Ice, Stone
+    if (terrain == 4u)  return uvec3(38u, 5u, 2u);   // Swamp: MudGrass, Clay, Stone
+    if (terrain == 3u)  return uvec3(4u, 4u, 2u);    // Coast: Sand, Sand, Stone
+    if (terrain == 16u) return uvec3(4u, 4u, 2u);    // CoralReef: Sand, Sand, Stone
+    if (terrain == 7u)  return uvec3(26u, 26u, 36u); // Volcano: Basalt, Basalt, Obsidian
+    if (terrain == 11u) return uvec3(2u, 2u, 2u);    // Caverns: Stone, Stone, Stone
+    if (terrain == 8u)  return uvec3(4u, 5u, 2u);    // DeepOcean: Sand, Clay, Stone
+    if (terrain == 14u) return uvec3(29u, 1u, 2u);   // DeathZone: Bone, Dirt, Stone
+    if (terrain == 15u) return uvec3(7u, 31u, 2u);   // AncientRuins: Grass, CutStone, Stone
+    if (terrain == 13u) return uvec3(7u, 1u, 2u);    // FlyingIslands: Grass, Dirt, Stone
+    return uvec3(2u, 1u, 2u); // default
+}
+
+// Returns ore material (12=IronOre, 13=CopperOre, 14=GoldOre, 15=Coal, 16=Crystal),
+// or 0 if no ore at this position. Mirrors Rust materialize.rs::ore_at.
+uint ore_at(int vx, int vy, int vz, uint seed, float ore_boost) {
+    float n = hash_f32_u64(vx, vy, vz, seed + 0x0EE1u);
+    float threshold_base = 0.92 - ore_boost;
+    float copper_base    = 0.88 - ore_boost;
+    float crystal_base   = 0.95 - ore_boost;
+
+    if (n > threshold_base) {
+        if (vz < 8) return 14u;        // GoldOre
+        else if (vz < 12) return 12u;  // IronOre
+        else return 15u;               // Coal
+    } else if (n > copper_base && vz < 10) {
+        return 13u; // CopperOre
+    } else if (n > crystal_base && vz < 6) {
+        return 16u; // Crystal
+    }
+    return 0u; // no ore
+}
+
 uint material_at(int vx, int vy, int vz, uint seed) {
+    RegionCell cell = sample_cell(float(vx), float(vy));
+    uint terrain = cell.terrain;
+
     int surface_z = surface_height_at(float(vx), float(vy), seed);
     int depth = surface_z - vz;
 
+    uvec3 mats = surface_materials(terrain);
+
+    // Ore boost for mountains/caverns.
+    float ore_boost = 0.0;
+    if (terrain == 2u || terrain == 11u) ore_boost = 0.03;
+
+    // Layer assignment — mirrors Rust materialize.rs:114-250.
     if (vz < -500) {
-        return MAT_GRANITE;
-    } else if (depth > 80) {
-        return MAT_STONE; // deep stone (no ore yet)
-    } else if (depth > 20) {
-        return MAT_STONE; // subsoil zone simplified
-    } else if (depth > 0) {
-        return MAT_DIRT;
-    } else if (depth >= -1) {
-        return MAT_GRASS;
-    } else {
-        return MAT_AIR;
+        return 3u; // Granite (deep bedrock)
     }
+    if (depth > 80) {
+        // Deep stone zone — ore veins possible.
+        uint ore = ore_at(vx, vy, vz, seed, ore_boost);
+        if (ore != 0u) return ore;
+        return mats.z; // deep_stone
+    }
+    if (depth > 20) {
+        // Subsoil zone.
+        if (terrain == 2u || terrain == 10u) {
+            // Mountains/Glacier: geological banding on cliff faces.
+            float band = sin(float(vz) * 0.15) * 0.5 + 0.5;
+            float n = hash_f32_u64(vx, vy, vz, seed + 0x1234u);
+            if (band > 0.75) return 3u;           // Granite
+            if (band > 0.5 && n > 0.3) return 6u; // Gravel
+            return 2u;                            // Stone
+        } else {
+            float n = hash_f32_u64(vx, vy, vz, seed + 0x1234u);
+            if (n > 0.4) return mats.z; // deep_stone
+            return mats.y;              // subsoil
+        }
+    }
+    if (depth > 0) {
+        // Near-surface soil.
+        if (terrain == 12u) {
+            // Badlands: layered sediment.
+            float band = sin(float(vz) * 0.3) * 0.5 + 0.5;
+            if (band > 0.7) return 5u;  // Clay
+            if (band > 0.4) return 27u; // Sandstone
+            return 39u;                 // RedSand
+        }
+        return mats.y; // subsoil
+    }
+    if (depth >= -1) {
+        // Surface layer (depth 0 or -1).
+        if (terrain == 2u || terrain == 10u) {
+            // Mountain surface: snow line + gravel patches.
+            float n = hash_f32_u64(vx, vy, vz, seed + 0xA1B2u);
+            if (vz > 750) return 11u; // Snow
+            if (vz > 600) {
+                float snow_prob = float(vz - 600) / 150.0;
+                if (n < snow_prob) return 11u; // Snow
+                if (n > 0.8) return 6u;        // Gravel
+                return 2u;                     // Stone
+            }
+            if (n > 0.7) return 6u; // Gravel
+            return 2u;              // Stone
+        }
+        if (terrain == 9u) {
+            // Jungle floor: undergrowth.
+            float pat = fbm_2d(float(vx) * 0.06, float(vy) * 0.06, seed + 0xBEAFu, 2, 2.0, 0.5);
+            float n = hash_f32_u64(vx, vy, vz, seed + 0xD00u);
+            if (pat > 0.65) return 5u;  // Clay (mud)
+            if (n > 0.9) return 17u;    // WoodLog (fallen branch)
+            if (n > 0.8) return 1u;     // Dirt
+            return 37u;                 // JungleMoss
+        }
+        if (terrain == 5u) {
+            // Desert: dune ridges.
+            float angle = 0.7;
+            float rx = float(vx) * cos(angle) + float(vy) * sin(angle);
+            float dune = sin(rx * 0.08) * 0.5 + 0.5;
+            float n = hash_f32_u64(vx, vy, vz, seed + 0xD0E5u);
+            if (dune > 0.7) return 27u; // Sandstone (dune crest)
+            if (n > 0.9) return 6u;     // Gravel
+            return 4u;                  // Sand
+        }
+        if (terrain == 1u) {
+            // Forest floor: subtle leaf litter.
+            float pat = fbm_2d(float(vx) * 0.04, float(vy) * 0.04, seed + 0xF0E5u, 2, 2.0, 0.5);
+            float n = hash_f32_u64(vx, vy, vz, seed + 0xF100u);
+            if (pat > 0.78) return 40u; // Peat (leaf litter)
+            if (n > 0.95) return 17u;   // WoodLog (rare fallen branch)
+            return 7u;                  // Grass
+        }
+        if (terrain == 0u) {
+            // Plains: TallGrass with darker grass patches.
+            float pat = fbm_2d(float(vx) * 0.04, float(vy) * 0.04, seed + 0xF1E1Du, 2, 2.0, 0.5);
+            if (pat > 0.6) return 7u; // Grass
+            return 41u;               // TallGrass
+        }
+        if (terrain == 12u) {
+            // Badlands: layered sediment on surface.
+            float band = sin(float(vz) * 0.3) * 0.5 + 0.5;
+            float n = hash_f32_u64(vx, vy, vz, seed + 0xBAD1u);
+            if (band > 0.7) return 27u;           // Sandstone
+            if (band > 0.4 && n > 0.5) return 5u; // Clay
+            return 39u;                           // RedSand
+        }
+        if (terrain == 6u) {
+            // Tundra: patchy snow over peat.
+            float n = hash_f32_u64(vx, vy, vz, seed + 0xC01Du);
+            float pat = fbm_2d(float(vx) * 0.015, float(vy) * 0.015, seed + 0xF02u, 3, 2.0, 0.5);
+            if (pat > 0.68) return 11u;           // Snow
+            if (pat > 0.6 && n > 0.6) return 10u; // Ice
+            if (n > 0.85) return 6u;              // Gravel
+            return 40u;                           // Peat
+        }
+        return mats.x; // default surface
+    }
+    // Above surface.
+    if (vz <= SEA_LEVEL && (terrain == 8u || terrain == 3u || terrain == 16u || terrain == 4u)) {
+        // DeepOcean / Coast / CoralReef / Swamp below sea level → water.
+        return 8u; // Water
+    }
+    return 0u; // Air
 }
 
 void main() {

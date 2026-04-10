@@ -10,10 +10,12 @@ const CHUNK_SIZE: usize = 64;
 const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
 const MAT_AIR: u8 = 0;
+#[allow(dead_code)]
 const MAT_DIRT: u8 = 1;
 const MAT_STONE: u8 = 2;
 #[allow(dead_code)]
 const MAT_GRANITE: u8 = 3;
+#[allow(dead_code)]
 const MAT_GRASS: u8 = 7;
 
 fn try_pipeline() -> Option<(VulkanContext, VulkanAllocator, TerrainComputePipeline)> {
@@ -27,6 +29,9 @@ fn try_pipeline() -> Option<(VulkanContext, VulkanAllocator, TerrainComputePipel
 fn surface_chunk_has_grass_dirt_stone() {
     // base_height = 0.3 * MAX_SURFACE_Z(2000) = 600. Surface lives near vz=600.
     // Chunk cz=9 covers vz=576..639, which straddles the surface.
+    // Task 9+: biome-aware materials means the output may include TallGrass,
+    // Peat, Sandstone, etc. depending on which cell (0,0) lands in. Assert
+    // that there's a mix of air and solids, not the exact material set.
     let (ctx, mut alloc, pipeline) = match try_pipeline() {
         Some(p) => p,
         None => { eprintln!("SKIP: no Vulkan"); return; }
@@ -34,17 +39,12 @@ fn surface_chunk_has_grass_dirt_stone() {
     let mats = pipeline.generate_chunk(&ctx, [0, 0, 9], 42).expect("dispatch");
     assert_eq!(mats.len(), CHUNK_VOLUME);
 
-    let grass = mats.iter().filter(|&&m| m == MAT_GRASS).count();
-    let dirt = mats.iter().filter(|&&m| m == MAT_DIRT).count();
-    let stone = mats.iter().filter(|&&m| m == MAT_STONE).count();
     let air = mats.iter().filter(|&&m| m == MAT_AIR).count();
-    eprintln!("grass={grass} dirt={dirt} stone={stone} air={air}");
+    let solid = CHUNK_VOLUME - air;
+    eprintln!("air={air} solid={solid}");
 
-    assert!(grass > 0, "no grass found in surface chunk");
-    assert!(dirt > 0, "no dirt found in surface chunk");
-    assert!(stone > 0, "no stone found in surface chunk");
     assert!(air > 0, "no air found in surface chunk");
-    assert_eq!(grass + dirt + stone + air, CHUNK_VOLUME, "unknown materials present");
+    assert!(solid > 0, "no solid found in surface chunk");
 
     pipeline.destroy(&ctx, &mut alloc);
 }
