@@ -57,9 +57,67 @@ float fbm_2d(float x, float y, uint seed, int octaves, float lacunarity, float g
     return sum / max_amp;
 }
 
-// Hardcoded base_height + forest amplitudes for now. Region plan in Task 8.
+// Region plan structures — must match Rust RegionCellGpu / RegionPlanHeader
+// byte-for-byte (std430). 32 bytes per cell, 16 bytes for header.
+struct RegionCell {
+    float height;
+    float moisture;
+    float temperature;
+    uint terrain;
+    uint sub_biome;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+layout(set = 0, binding = 1) readonly buffer RegionCellsBuf {
+    RegionCell cells[];
+} region;
+
+layout(set = 0, binding = 2) readonly buffer RegionHeaderBuf {
+    uint cols;
+    uint rows;
+    uint cell_size;
+    uint _pad;
+} header;
+
+// Sample the nearest region cell for a voxel (vx, vy) position.
+RegionCell sample_cell(float vx, float vy) {
+    int col = clamp(int(floor(vx / float(header.cell_size))), 0, int(header.cols) - 1);
+    int row = clamp(int(floor(vy / float(header.cell_size))), 0, int(header.rows) - 1);
+    return region.cells[row * int(header.cols) + col];
+}
+
+// Bilinear interpolation of region cell height at (vx, vy).
+// Mirrors Rust RegionPlan::interpolate_height.
+float interpolate_height(float vx, float vy) {
+    float cs = float(header.cell_size);
+    float cx = vx / cs;
+    float cy = vy / cs;
+    int col0 = clamp(int(floor(cx)), 0, int(header.cols) - 1);
+    int row0 = clamp(int(floor(cy)), 0, int(header.rows) - 1);
+    int col1 = min(col0 + 1, int(header.cols) - 1);
+    int row1 = min(row0 + 1, int(header.rows) - 1);
+    float tx = cx - floor(cx);
+    float ty = cy - floor(cy);
+    float h00 = region.cells[row0 * int(header.cols) + col0].height;
+    float h10 = region.cells[row0 * int(header.cols) + col1].height;
+    float h01 = region.cells[row1 * int(header.cols) + col0].height;
+    float h11 = region.cells[row1 * int(header.cols) + col1].height;
+    float h0 = h00 + (h10 - h00) * tx;
+    float h1 = h01 + (h11 - h01) * tx;
+    return h0 + (h1 - h0) * ty;
+}
+
+// Biome-aware surface height. Terrain enum mapping must match
+// src/world_sim/state.rs::Terrain::to_u32:
+//   0=Plains 1=Forest 2=Mountains 3=Coast 4=Swamp 5=Desert 6=Tundra
+//   7=Volcano 8=DeepOcean 9=Jungle 10=Glacier 11=Caverns 12=Badlands
+//   13=FlyingIslands 14=DeathZone 15=AncientRuins 16=CoralReef
 int surface_height_at(float vx, float vy, uint seed) {
-    float base_height = 0.3;
+    float base_height = interpolate_height(vx, vy);
+    RegionCell cell = sample_cell(vx, vy);
+    uint terrain = cell.terrain;
 
     // Per-octave seed offsets must match Rust materialize.rs::surface_height_at:
     // 0xface_cafe, 0xdead_beef, 0xcafe_babe.
@@ -67,9 +125,30 @@ int surface_height_at(float vx, float vy, uint seed) {
     float medium = fbm_2d(vx * 0.015, vy * 0.015, seed + 0xdeadbeefu, 3, 2.0, 0.5);
     float small = fbm_2d(vx * 0.06, vy * 0.06, seed + 0xcafebabeu, 2, 2.0, 0.5);
 
-    float large_amp = 30.0;
-    float medium_amp = 12.0;
+    // Default (matches the `_` arm in Rust: (25.0, 10.0, 3.0)).
+    float large_amp = 25.0;
+    float medium_amp = 10.0;
     float small_amp = 3.0;
+
+    if (terrain == 2u || terrain == 10u) {        // Mountains | Glacier
+        large_amp = 80.0; medium_amp = 30.0; small_amp = 5.0;
+    } else if (terrain == 7u) {                   // Volcano
+        large_amp = 60.0; medium_amp = 25.0; small_amp = 4.0;
+    } else if (terrain == 12u) {                  // Badlands
+        large_amp = 50.0; medium_amp = 35.0; small_amp = 10.0;
+    } else if (terrain == 1u) {                   // Forest
+        large_amp = 30.0; medium_amp = 12.0; small_amp = 3.0;
+    } else if (terrain == 9u) {                   // Jungle
+        large_amp = 45.0; medium_amp = 20.0; small_amp = 6.0;
+    } else if (terrain == 6u) {                   // Tundra
+        large_amp = 25.0; medium_amp = 10.0; small_amp = 2.0;
+    } else if (terrain == 5u) {                   // Desert
+        large_amp = 35.0; medium_amp = 20.0; small_amp = 4.0;
+    } else if (terrain == 4u || terrain == 3u) {  // Swamp | Coast
+        large_amp = 5.0; medium_amp = 3.0; small_amp = 1.0;
+    } else if (terrain == 8u || terrain == 16u) { // DeepOcean | CoralReef
+        large_amp = 10.0; medium_amp = 5.0; small_amp = 1.0;
+    }
 
     float detail = (large * 2.0 - 1.0) * large_amp
                  + (medium * 2.0 - 1.0) * medium_amp
