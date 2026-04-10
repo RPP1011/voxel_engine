@@ -21,6 +21,64 @@ float hash_f32(int x, int y, int z, uint seed) {
     return float(hash_u32(x, y, z, seed)) / 4294967295.0;
 }
 
+float smoothstep_t(float t) {
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// Mirrors Rust value_noise_2d (with the s32 fold).
+float value_noise_2d(float x, float y, uint seed, float scale) {
+    float sx = x / scale;
+    float sy = y / scale;
+    int ix = int(floor(sx));
+    int iy = int(floor(sy));
+    float fx = smoothstep_t(sx - floor(sx));
+    float fy = smoothstep_t(sy - floor(sy));
+    float h00 = hash_f32(ix,     iy,     0, seed);
+    float h10 = hash_f32(ix + 1, iy,     0, seed);
+    float h01 = hash_f32(ix,     iy + 1, 0, seed);
+    float h11 = hash_f32(ix + 1, iy + 1, 0, seed);
+    float a = h00 + (h10 - h00) * fx;
+    float b = h01 + (h11 - h01) * fx;
+    return a + (b - a) * fy;
+}
+
+// Mirrors Rust fbm_2d. Note the per-octave seed offset matches Rust: seed + i*31337.
+float fbm_2d(float x, float y, uint seed, int octaves, float lacunarity, float gain) {
+    float sum = 0.0;
+    float amp = 1.0;
+    float freq = 1.0;
+    float max_amp = 0.0;
+    for (int i = 0; i < octaves; i++) {
+        sum += amp * value_noise_2d(x * freq, y * freq, seed + uint(i * 31337), 1.0);
+        max_amp += amp;
+        amp *= gain;
+        freq *= lacunarity;
+    }
+    return sum / max_amp;
+}
+
+// Hardcoded base_height + forest amplitudes for now. Region plan in Task 8.
+int surface_height_at(float vx, float vy, uint seed) {
+    float base_height = 0.3;
+
+    // Per-octave seed offsets must match Rust materialize.rs::surface_height_at:
+    // 0xface_cafe, 0xdead_beef, 0xcafe_babe.
+    float large = fbm_2d(vx * 0.004, vy * 0.004, seed + 0xfacecafeu, 4, 2.0, 0.5);
+    float medium = fbm_2d(vx * 0.015, vy * 0.015, seed + 0xdeadbeefu, 3, 2.0, 0.5);
+    float small = fbm_2d(vx * 0.06, vy * 0.06, seed + 0xcafebabeu, 2, 2.0, 0.5);
+
+    float large_amp = 30.0;
+    float medium_amp = 12.0;
+    float small_amp = 3.0;
+
+    float detail = (large * 2.0 - 1.0) * large_amp
+                 + (medium * 2.0 - 1.0) * medium_amp
+                 + (small * 2.0 - 1.0) * small_amp;
+
+    const int MAX_SURFACE_Z = 2000;
+    return int(round(base_height * float(MAX_SURFACE_Z) + detail));
+}
+
 // One invocation per 4-voxel x-strip. With cs=64, x dim = 16 strips.
 // Local size: 16 × 8 × 8 = 1024 (max for most GPUs).
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 8) in;
@@ -35,12 +93,29 @@ layout(push_constant) uniform PushConstants {
     uvec4 params;          // (seed, chunk_size, _, _)
 } pc;
 
-const uint MAT_AIR   = 0u;
-const uint MAT_STONE = 2u;
+const uint MAT_AIR     = 0u;
+const uint MAT_DIRT    = 1u;
+const uint MAT_STONE   = 2u;
+const uint MAT_GRANITE = 3u;
+const uint MAT_GRASS   = 7u;
 
 uint material_at(int vx, int vy, int vz, uint seed) {
-    // SKELETON: stone below z=0, air above. Real materializer comes in Task 6.
-    return (vz < 0) ? MAT_STONE : MAT_AIR;
+    int surface_z = surface_height_at(float(vx), float(vy), seed);
+    int depth = surface_z - vz;
+
+    if (vz < -500) {
+        return MAT_GRANITE;
+    } else if (depth > 80) {
+        return MAT_STONE; // deep stone (no ore yet)
+    } else if (depth > 20) {
+        return MAT_STONE; // subsoil zone simplified
+    } else if (depth > 0) {
+        return MAT_DIRT;
+    } else if (depth >= -1) {
+        return MAT_GRASS;
+    } else {
+        return MAT_AIR;
+    }
 }
 
 void main() {
