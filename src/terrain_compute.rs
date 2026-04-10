@@ -1,7 +1,11 @@
 //! GPU terrain materialization pipeline.
 //!
 //! Dispatches a compute shader that fills a chunk's worth of voxel materials
-//! based on chunk position, seed, and (eventually) region plan data.
+//! based on chunk position, seed, and region plan data.
+//!
+//! Uses a ring of N in-flight slots, each with its own output buffer, command
+//! pool/buffer, fence, and descriptor set. This lets the renderer submit
+//! multiple chunks per frame and poll for completion without blocking.
 
 use anyhow::{Context, Result};
 use ash::vk;
@@ -12,6 +16,9 @@ use crate::vulkan::instance::VulkanContext;
 const CHUNK_SIZE: u32 = 64;
 const CHUNK_VOLUME: u32 = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 const OUTPUT_BYTES: u64 = CHUNK_VOLUME as u64; // 1 byte per voxel
+
+/// Number of in-flight compute dispatches allowed.
+const NUM_SLOTS: usize = 8;
 
 /// GPU layout of a single region plan cell. Mirrors the GLSL `RegionCell`
 /// struct in `shaders/terrain_materialize.comp`. Uses std430 layout with
@@ -62,13 +69,30 @@ pub struct RiverHeaderGpu {
     pub _pad1: u32,
 }
 
+/// One in-flight compute dispatch slot. Each slot owns a full set of
+/// per-dispatch Vulkan resources so multiple chunks can be in flight at once.
+struct ComputeSlot {
+    output_buffer: AllocatedBuffer,
+    descriptor_set: vk::DescriptorSet,
+    fence: vk::Fence,
+    cmd_pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+    in_use: bool,
+    chunk_pos: [i32; 3],
+    request_id: u64,
+}
+
 pub struct TerrainComputePipeline {
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
-    output_buffer: AllocatedBuffer,
+    shader_module: vk::ShaderModule,
+    // Ring of in-flight slots.
+    slots: Vec<ComputeSlot>,
+    next_request_id: u64,
+    // Region plan + rivers (shared across all slots; re-bound to every slot's
+    // descriptor set whenever they are uploaded).
     region_cells_buffer: Option<AllocatedBuffer>,
     region_header_buffer: Option<AllocatedBuffer>,
     placeholder_cells_buffer: AllocatedBuffer,
@@ -77,12 +101,12 @@ pub struct TerrainComputePipeline {
     river_headers_buffer: Option<AllocatedBuffer>,
     placeholder_river_points: AllocatedBuffer,
     placeholder_river_headers: AllocatedBuffer,
-    shader_module: vk::ShaderModule,
 }
 
 impl TerrainComputePipeline {
     pub fn new(ctx: &VulkanContext, alloc: &mut VulkanAllocator) -> Result<Self> {
         let device = ctx.device();
+        let cq = ctx.compute_queue().context("no compute queue")?;
 
         // Load precompiled SPIR-V from OUT_DIR/shaders.
         let spirv_bytes = include_bytes!(concat!(
@@ -141,10 +165,10 @@ impl TerrainComputePipeline {
             .offset(0)
             .size(32);
 
-        let set_layouts = [descriptor_set_layout];
+        let set_layouts_one = [descriptor_set_layout];
         let push_ranges = [push_range];
         let pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts)
+            .set_layouts(&set_layouts_one)
             .push_constant_ranges(&push_ranges);
         let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_ci, None) }
             .context("pipeline layout")?;
@@ -162,36 +186,31 @@ impl TerrainComputePipeline {
         .map_err(|(_, e)| e)
         .context("compute pipeline")?[0];
 
-        // Descriptor pool with five storage buffer descriptors.
+        // Descriptor pool sized for NUM_SLOTS sets × 5 storage buffer bindings.
         let pool_size = vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(5);
+            .descriptor_count((NUM_SLOTS * 5) as u32);
         let pool_sizes = [pool_size];
         let pool_ci = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
-            .max_sets(1);
+            .max_sets(NUM_SLOTS as u32);
         let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_ci, None) }
             .context("descriptor pool")?;
 
+        // Allocate NUM_SLOTS descriptor sets in one call (same layout for each).
+        let set_layouts_all: Vec<vk::DescriptorSetLayout> =
+            vec![descriptor_set_layout; NUM_SLOTS];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
-            .set_layouts(&set_layouts);
-        let descriptor_set = unsafe { device.allocate_descriptor_sets(&alloc_info) }
-            .context("alloc descriptor set")?[0];
+            .set_layouts(&set_layouts_all);
+        let descriptor_sets = unsafe { device.allocate_descriptor_sets(&alloc_info) }
+            .context("alloc descriptor sets")?;
 
-        // Output buffer: host-visible so we can read back without an extra copy.
-        let output_buffer = alloc
-            .allocate_host_visible_buffer(OUTPUT_BYTES)
-            .context("output buffer")?;
+        // --- Placeholder buffers (shared, rebound onto every slot) -----------
 
-        // Placeholder buffers for bindings 1 and 2 so the descriptor set is
-        // always valid (prevents shader crashes before upload_region_plan).
-        // Size must be >= one RegionCellGpu (32 B) / one RegionPlanHeader (16 B).
         let mut placeholder_cells_buffer = alloc
             .allocate_host_visible_buffer(std::mem::size_of::<RegionCellGpu>() as u64)
             .context("placeholder cells buffer")?;
-        // Write a zeroed RegionCellGpu (terrain=0=Plains) so the shader gets
-        // sane defaults if it's ever dispatched before a real upload.
         let zero_cell = RegionCellGpu {
             height: 0.3,
             moisture: 0.5,
@@ -231,9 +250,6 @@ impl TerrainComputePipeline {
             .write_data(0, zero_header_bytes)
             .context("write placeholder header")?;
 
-        // Placeholder river buffers. We allocate 1 dummy point and 1 dummy
-        // header with length=0 so iteration is a no-op if upload_rivers
-        // is never called.
         let mut placeholder_river_points = alloc
             .allocate_host_visible_buffer(std::mem::size_of::<RiverPointGpu>() as u64)
             .context("placeholder river points buffer")?;
@@ -256,7 +272,6 @@ impl TerrainComputePipeline {
         let mut placeholder_river_headers = alloc
             .allocate_host_visible_buffer(std::mem::size_of::<RiverHeaderGpu>() as u64)
             .context("placeholder river headers buffer")?;
-        // length=0 so the shader's inner loop never runs for this dummy.
         let zero_river_hdr = RiverHeaderGpu {
             start_idx: 0,
             length: 0,
@@ -273,63 +288,108 @@ impl TerrainComputePipeline {
             .write_data(0, zero_river_hdr_bytes)
             .context("write placeholder river header")?;
 
-        // Bind all five buffers to the descriptor set.
-        let output_info = [vk::DescriptorBufferInfo::default()
-            .buffer(output_buffer.buffer())
-            .offset(0)
-            .range(OUTPUT_BYTES)];
-        let cells_info = [vk::DescriptorBufferInfo::default()
-            .buffer(placeholder_cells_buffer.buffer())
-            .offset(0)
-            .range(std::mem::size_of::<RegionCellGpu>() as u64)];
-        let header_info = [vk::DescriptorBufferInfo::default()
-            .buffer(placeholder_header_buffer.buffer())
-            .offset(0)
-            .range(std::mem::size_of::<RegionPlanHeader>() as u64)];
-        let river_points_info = [vk::DescriptorBufferInfo::default()
-            .buffer(placeholder_river_points.buffer())
-            .offset(0)
-            .range(std::mem::size_of::<RiverPointGpu>() as u64)];
-        let river_headers_info = [vk::DescriptorBufferInfo::default()
-            .buffer(placeholder_river_headers.buffer())
-            .offset(0)
-            .range(std::mem::size_of::<RiverHeaderGpu>() as u64)];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&output_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&cells_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&header_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&river_points_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&river_headers_info),
-        ];
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        // --- Per-slot resources ---------------------------------------------
+
+        let mut slots: Vec<ComputeSlot> = Vec::with_capacity(NUM_SLOTS);
+        for slot_idx in 0..NUM_SLOTS {
+            // Output buffer (host-visible) for this slot.
+            let output_buffer = alloc
+                .allocate_host_visible_buffer(OUTPUT_BYTES)
+                .context("slot output buffer")?;
+
+            // Per-slot command pool so we can reset it independently.
+            let cmd_pool_ci = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(cq.family_index)
+                .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+            let cmd_pool = unsafe { device.create_command_pool(&cmd_pool_ci, None) }
+                .context("slot command pool")?;
+
+            let cmd_alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(cmd_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd = unsafe { device.allocate_command_buffers(&cmd_alloc) }
+                .context("slot command buffer")?[0];
+
+            // Start fences UNSIGNALED; we'll reset+signal on first submit.
+            let fence = unsafe {
+                device.create_fence(&vk::FenceCreateInfo::default(), None)
+            }
+            .context("slot fence")?;
+
+            let descriptor_set = descriptor_sets[slot_idx];
+
+            // Initial descriptor writes: output → slot's own buffer,
+            // region + river bindings → placeholders.
+            let output_info = [vk::DescriptorBufferInfo::default()
+                .buffer(output_buffer.buffer())
+                .offset(0)
+                .range(OUTPUT_BYTES)];
+            let cells_info = [vk::DescriptorBufferInfo::default()
+                .buffer(placeholder_cells_buffer.buffer())
+                .offset(0)
+                .range(std::mem::size_of::<RegionCellGpu>() as u64)];
+            let header_info = [vk::DescriptorBufferInfo::default()
+                .buffer(placeholder_header_buffer.buffer())
+                .offset(0)
+                .range(std::mem::size_of::<RegionPlanHeader>() as u64)];
+            let river_points_info = [vk::DescriptorBufferInfo::default()
+                .buffer(placeholder_river_points.buffer())
+                .offset(0)
+                .range(std::mem::size_of::<RiverPointGpu>() as u64)];
+            let river_headers_info = [vk::DescriptorBufferInfo::default()
+                .buffer(placeholder_river_headers.buffer())
+                .offset(0)
+                .range(std::mem::size_of::<RiverHeaderGpu>() as u64)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&output_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&cells_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&header_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&river_points_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&river_headers_info),
+            ];
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+
+            slots.push(ComputeSlot {
+                output_buffer,
+                descriptor_set,
+                fence,
+                cmd_pool,
+                cmd,
+                in_use: false,
+                chunk_pos: [0, 0, 0],
+                request_id: 0,
+            });
+        }
 
         Ok(Self {
             pipeline,
             pipeline_layout,
             descriptor_set_layout,
             descriptor_pool,
-            descriptor_set,
-            output_buffer,
+            shader_module,
+            slots,
+            next_request_id: 1,
             region_cells_buffer: None,
             region_header_buffer: None,
             placeholder_cells_buffer,
@@ -338,14 +398,103 @@ impl TerrainComputePipeline {
             river_headers_buffer: None,
             placeholder_river_points,
             placeholder_river_headers,
-            shader_module,
         })
     }
 
+    /// Update bindings 1 + 2 on every slot's descriptor set to point at the
+    /// supplied cells and header buffers.
+    fn rebind_region_on_all_slots(
+        &self,
+        ctx: &VulkanContext,
+        cells_buf: &AllocatedBuffer,
+        cells_size: u64,
+        header_buf: &AllocatedBuffer,
+        header_size: u64,
+    ) {
+        let device = ctx.device();
+        let cells_info = [vk::DescriptorBufferInfo::default()
+            .buffer(cells_buf.buffer())
+            .offset(0)
+            .range(cells_size)];
+        let header_info = [vk::DescriptorBufferInfo::default()
+            .buffer(header_buf.buffer())
+            .offset(0)
+            .range(header_size)];
+        for slot in &self.slots {
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(slot.descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&cells_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(slot.descriptor_set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&header_info),
+            ];
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+        }
+    }
+
+    /// Update bindings 3 + 4 on every slot's descriptor set to point at the
+    /// supplied river points and headers buffers.
+    fn rebind_rivers_on_all_slots(
+        &self,
+        ctx: &VulkanContext,
+        points_buf: &AllocatedBuffer,
+        points_size: u64,
+        headers_buf: &AllocatedBuffer,
+        headers_size: u64,
+    ) {
+        let device = ctx.device();
+        let points_info = [vk::DescriptorBufferInfo::default()
+            .buffer(points_buf.buffer())
+            .offset(0)
+            .range(points_size)];
+        let headers_info = [vk::DescriptorBufferInfo::default()
+            .buffer(headers_buf.buffer())
+            .offset(0)
+            .range(headers_size)];
+        for slot in &self.slots {
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(slot.descriptor_set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&points_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(slot.descriptor_set)
+                    .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&headers_info),
+            ];
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+        }
+    }
+
+    /// Wait for all in-flight slots to drain. Used before destroying or
+    /// freeing buffers that slots may reference.
+    fn wait_idle(&mut self, ctx: &VulkanContext) -> Result<()> {
+        let device = ctx.device();
+        let fences: Vec<vk::Fence> = self
+            .slots
+            .iter()
+            .filter(|s| s.in_use)
+            .map(|s| s.fence)
+            .collect();
+        if !fences.is_empty() {
+            unsafe { device.wait_for_fences(&fences, true, u64::MAX)? };
+        }
+        // Mark everything free (callers are about to tear down or re-upload).
+        for slot in self.slots.iter_mut() {
+            slot.in_use = false;
+        }
+        Ok(())
+    }
+
     /// Upload (or re-upload) the region plan cells + header to GPU storage
-    /// buffers and update the descriptor set bindings 1/2 to point at them.
-    /// Caller is responsible for invoking this once the plan is known, and
-    /// again if the plan is replaced.
+    /// buffers and update the descriptor set bindings 1/2 on every slot.
     pub fn upload_region_plan(
         &mut self,
         ctx: &VulkanContext,
@@ -362,6 +511,9 @@ impl TerrainComputePipeline {
                 cols * rows
             );
         }
+
+        // Make sure nothing is reading the old bindings.
+        self.wait_idle(ctx)?;
 
         // 1. Free any previously-uploaded buffers.
         if let Some(old) = self.region_cells_buffer.take() {
@@ -404,31 +556,8 @@ impl TerrainComputePipeline {
             .write_data(0, header_bytes)
             .context("write region header")?;
 
-        // 4. Update descriptor set bindings 1 and 2 to point at the real
-        //    buffers. Safe to do because we wait on every dispatch before
-        //    returning — no in-flight use of the descriptor set.
-        let device = ctx.device();
-        let cells_info = [vk::DescriptorBufferInfo::default()
-            .buffer(cells_buf.buffer())
-            .offset(0)
-            .range(cells_size)];
-        let header_info = [vk::DescriptorBufferInfo::default()
-            .buffer(header_buf.buffer())
-            .offset(0)
-            .range(header_size)];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.descriptor_set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&cells_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.descriptor_set)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&header_info),
-        ];
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        // 4. Update descriptor set bindings on ALL slots.
+        self.rebind_region_on_all_slots(ctx, &cells_buf, cells_size, &header_buf, header_size);
 
         self.region_cells_buffer = Some(cells_buf);
         self.region_header_buffer = Some(header_buf);
@@ -436,7 +565,7 @@ impl TerrainComputePipeline {
     }
 
     /// Upload (or re-upload) the river polylines to GPU storage buffers and
-    /// update the descriptor set bindings 3/4 to point at them.
+    /// update the descriptor set bindings 3/4 on every slot.
     ///
     /// If `points` or `headers` is empty, a single dummy entry is uploaded
     /// (length=0 header) so the shader inner loop simply does nothing.
@@ -447,6 +576,8 @@ impl TerrainComputePipeline {
         points: &[RiverPointGpu],
         headers: &[RiverHeaderGpu],
     ) -> Result<()> {
+        self.wait_idle(ctx)?;
+
         // 1. Free any previously-uploaded buffers.
         if let Some(old) = self.river_points_buffer.take() {
             alloc.free_buffer(old);
@@ -512,68 +643,49 @@ impl TerrainComputePipeline {
             .write_data(0, headers_bytes)
             .context("write river headers")?;
 
-        // 5. Update descriptor set bindings 3 and 4.
-        let device = ctx.device();
-        let points_info = [vk::DescriptorBufferInfo::default()
-            .buffer(points_buf.buffer())
-            .offset(0)
-            .range(points_size)];
-        let headers_info = [vk::DescriptorBufferInfo::default()
-            .buffer(headers_buf.buffer())
-            .offset(0)
-            .range(headers_size)];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.descriptor_set)
-                .dst_binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&points_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.descriptor_set)
-                .dst_binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&headers_info),
-        ];
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        // 5. Update descriptor set bindings 3 and 4 on every slot.
+        self.rebind_rivers_on_all_slots(ctx, &points_buf, points_size, &headers_buf, headers_size);
 
         self.river_points_buffer = Some(points_buf);
         self.river_headers_buffer = Some(headers_buf);
         Ok(())
     }
 
-    /// Dispatch the compute shader for one chunk and return the materials as a flat Vec.
-    /// Index ordering: `[z * cs * cs + y * cs + x]`.
-    pub fn generate_chunk(
-        &self,
+    /// Submit a chunk for GPU generation. Returns Some(id) if a slot was free,
+    /// None if all slots are currently in flight.
+    pub fn submit_chunk(
+        &mut self,
         ctx: &VulkanContext,
         chunk_pos: [i32; 3],
         seed: u32,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Option<u64>> {
+        let slot_idx = match self.slots.iter().position(|s| !s.in_use) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+
         let device = ctx.device();
         let cq = ctx.compute_queue().context("no compute queue")?;
+        let pipeline = self.pipeline;
+        let pipeline_layout = self.pipeline_layout;
+        let slot = &mut self.slots[slot_idx];
 
-        // One-shot command buffer.
-        let cmd_pool_ci = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(cq.family_index)
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT);
-        let cmd_pool = unsafe { device.create_command_pool(&cmd_pool_ci, None) }?;
-        let cmd_alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(cmd_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmd = unsafe { device.allocate_command_buffers(&cmd_alloc) }?[0];
-
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
-            device.begin_command_buffer(cmd, &begin)?;
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            // Reset the command pool so we can re-record into the cmd buffer.
+            device.reset_command_pool(slot.cmd_pool, vk::CommandPoolResetFlags::empty())?;
+
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device.begin_command_buffer(slot.cmd, &begin)?;
+            device.cmd_bind_pipeline(slot.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(
-                cmd,
+                slot.cmd,
                 vk::PipelineBindPoint::COMPUTE,
-                self.pipeline_layout,
+                pipeline_layout,
                 0,
-                &[self.descriptor_set],
+                &[slot.descriptor_set],
                 &[],
             );
 
@@ -585,28 +697,26 @@ impl TerrainComputePipeline {
             push[16..20].copy_from_slice(&seed.to_le_bytes());
             push[20..24].copy_from_slice(&CHUNK_SIZE.to_le_bytes());
             device.cmd_push_constants(
-                cmd,
-                self.pipeline_layout,
+                slot.cmd,
+                pipeline_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
                 &push,
             );
 
-            // Dispatch: shader uses 16×8×8 local size and processes cs/4 strips in x.
-            // Workgroups: ceil(cs_words/16) × ceil(cs/8) × ceil(cs/8).
-            // For cs=64: cs_words=16, so 1 × 8 × 8 = 64 workgroups.
+            // Dispatch: shader uses 16×8×8 local size; cs/4 strips in x.
             let cs_words = CHUNK_SIZE / 4;
             let groups_x = (cs_words + 15) / 16;
             let groups_y = (CHUNK_SIZE + 7) / 8;
             let groups_z = (CHUNK_SIZE + 7) / 8;
-            device.cmd_dispatch(cmd, groups_x, groups_y, groups_z);
+            device.cmd_dispatch(slot.cmd, groups_x, groups_y, groups_z);
 
-            // Memory barrier so host can read.
+            // Memory barrier so host can read after the fence is signaled.
             let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ);
             device.cmd_pipeline_barrier(
-                cmd,
+                slot.cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
@@ -615,35 +725,100 @@ impl TerrainComputePipeline {
                 &[],
             );
 
-            device.end_command_buffer(cmd)?;
+            device.end_command_buffer(slot.cmd)?;
+
+            // Reset the fence (will be signaled on submission completion).
+            device.reset_fences(&[slot.fence])?;
+
+            let cmds = [slot.cmd];
+            let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+            device.queue_submit(cq.queue, &[submit], slot.fence)?;
         }
 
-        // Submit and wait via fence.
-        let cmds = [cmd];
-        let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-        unsafe {
-            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
-            device.queue_submit(cq.queue, &[submit], fence)?;
-            device.wait_for_fences(&[fence], true, u64::MAX)?;
-            device.destroy_fence(fence, None);
-            device.destroy_command_pool(cmd_pool, None);
-        }
-
-        // Read back the buffer.
-        let bytes = self.output_buffer.read_data(0, OUTPUT_BYTES as usize)?;
-        Ok(bytes)
+        slot.in_use = true;
+        slot.chunk_pos = chunk_pos;
+        slot.request_id = request_id;
+        Ok(Some(request_id))
     }
 
-    pub fn destroy(self, ctx: &VulkanContext, alloc: &mut VulkanAllocator) {
+    /// Poll all in-use slots for completion. Returns (request_id, chunk_pos,
+    /// materials) for each slot whose fence is signaled. Non-blocking — if no
+    /// slots are ready, returns an empty Vec.
+    pub fn try_take_completed(
+        &mut self,
+        ctx: &VulkanContext,
+    ) -> Result<Vec<(u64, [i32; 3], Vec<u8>)>> {
         let device = ctx.device();
+        let mut completed = Vec::new();
+        for slot in self.slots.iter_mut() {
+            if !slot.in_use {
+                continue;
+            }
+            let status = unsafe { device.get_fence_status(slot.fence) };
+            match status {
+                Ok(true) => {
+                    let bytes = slot.output_buffer.read_data(0, OUTPUT_BYTES as usize)?;
+                    completed.push((slot.request_id, slot.chunk_pos, bytes));
+                    slot.in_use = false;
+                }
+                Ok(false) => {
+                    // Still running, leave in-flight.
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(completed)
+    }
+
+    /// Synchronous wrapper: submits a chunk and spin-polls until it completes.
+    /// Primarily for tests + smoke runs that want a blocking API.
+    pub fn generate_chunk(
+        &mut self,
+        ctx: &VulkanContext,
+        chunk_pos: [i32; 3],
+        seed: u32,
+    ) -> Result<Vec<u8>> {
+        // If all slots happen to be in flight, spin briefly until one frees.
+        let req_id = loop {
+            match self.submit_chunk(ctx, chunk_pos, seed)? {
+                Some(id) => break id,
+                None => {
+                    // Drain anything that may have completed while waiting.
+                    let _ = self.try_take_completed(ctx)?;
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+            }
+        };
+        loop {
+            let completed = self.try_take_completed(ctx)?;
+            for (rid, _cp, bytes) in completed {
+                if rid == req_id {
+                    return Ok(bytes);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    }
+
+    pub fn destroy(mut self, ctx: &VulkanContext, alloc: &mut VulkanAllocator) {
+        let device = ctx.device();
+        // Drain any in-flight submissions first.
+        let _ = self.wait_idle(ctx);
+
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             device.destroy_shader_module(self.shader_module, None);
+
+            for slot in self.slots.drain(..) {
+                device.destroy_fence(slot.fence, None);
+                device.destroy_command_pool(slot.cmd_pool, None);
+                alloc.free_buffer(slot.output_buffer);
+            }
         }
-        alloc.free_buffer(self.output_buffer);
+
         alloc.free_buffer(self.placeholder_cells_buffer);
         alloc.free_buffer(self.placeholder_header_buffer);
         alloc.free_buffer(self.placeholder_river_points);

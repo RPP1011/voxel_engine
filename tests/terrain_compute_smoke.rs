@@ -32,7 +32,7 @@ fn surface_chunk_has_grass_dirt_stone() {
     // Task 9+: biome-aware materials means the output may include TallGrass,
     // Peat, Sandstone, etc. depending on which cell (0,0) lands in. Assert
     // that there's a mix of air and solids, not the exact material set.
-    let (ctx, mut alloc, pipeline) = match try_pipeline() {
+    let (ctx, mut alloc, mut pipeline) = match try_pipeline() {
         Some(p) => p,
         None => { eprintln!("SKIP: no Vulkan"); return; }
     };
@@ -51,7 +51,7 @@ fn surface_chunk_has_grass_dirt_stone() {
 
 #[test]
 fn deep_chunk_is_solid() {
-    let (ctx, mut alloc, pipeline) = match try_pipeline() {
+    let (ctx, mut alloc, mut pipeline) = match try_pipeline() {
         Some(p) => p,
         None => { eprintln!("SKIP: no Vulkan"); return; }
     };
@@ -66,7 +66,7 @@ fn deep_chunk_is_solid() {
 
 #[test]
 fn high_sky_chunk_is_air() {
-    let (ctx, mut alloc, pipeline) = match try_pipeline() {
+    let (ctx, mut alloc, mut pipeline) = match try_pipeline() {
         Some(p) => p,
         None => { eprintln!("SKIP: no Vulkan"); return; }
     };
@@ -79,7 +79,7 @@ fn high_sky_chunk_is_air() {
 
 #[test]
 fn deterministic_for_same_inputs() {
-    let (ctx, mut alloc, pipeline) = match try_pipeline() {
+    let (ctx, mut alloc, mut pipeline) = match try_pipeline() {
         Some(p) => p,
         None => { eprintln!("SKIP: no Vulkan"); return; }
     };
