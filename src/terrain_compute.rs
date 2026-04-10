@@ -3,9 +3,11 @@
 //! Dispatches a compute shader that fills a chunk's worth of voxel materials
 //! based on chunk position, seed, and region plan data.
 //!
-//! Uses a ring of N in-flight slots, each with its own output buffer, command
-//! pool/buffer, fence, and descriptor set. This lets the renderer submit
-//! multiple chunks per frame and poll for completion without blocking.
+//! Maintains a pool of N chunk texture slots. Each slot owns a 3D R8_UINT
+//! storage image that the compute shader writes directly into via imageStore,
+//! plus the per-dispatch Vulkan resources (cmd pool, cmd, fence, descriptor
+//! set). Slots stay GPU-resident after a dispatch completes so the renderer
+//! can sample them directly; eviction is LRU based on `last_touched_frame`.
 
 use anyhow::{Context, Result};
 use ash::vk;
@@ -18,8 +20,23 @@ const CHUNK_SIZE: u32 = 64;
 const CHUNK_VOLUME: u32 = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 const OUTPUT_BYTES: u64 = CHUNK_VOLUME as u64; // 1 byte per voxel
 
-/// Number of in-flight compute dispatches allowed.
-const NUM_SLOTS: usize = 8;
+/// Number of chunk texture pool slots. 64³ R8_UINT = 256KB each × 256 = 64MB
+/// of GPU memory dedicated to the pool.
+const NUM_SLOTS: usize = 256;
+
+/// Key used to identify a chunk in the pool — voxel chunk coordinates.
+pub type ChunkKey = [i32; 3];
+
+/// Lifecycle state of a single chunk texture pool slot.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum SlotState {
+    /// Ready to be assigned a new dispatch.
+    Free,
+    /// Dispatch submitted; waiting for fence. Carries the request id.
+    InFlight(u64),
+    /// Image holds valid chunk data, ready for render sampling.
+    Loaded(ChunkKey),
+}
 
 /// GPU layout of a single region plan cell. Mirrors the GLSL `RegionCell`
 /// struct in `shaders/terrain_materialize.comp`. Uses std430 layout with
@@ -70,29 +87,36 @@ pub struct RiverHeaderGpu {
     pub _pad1: u32,
 }
 
-/// One in-flight compute dispatch slot. Each slot owns a full set of
-/// per-dispatch Vulkan resources so multiple chunks can be in flight at once.
+/// One chunk texture pool slot. Each slot owns a full set of per-dispatch
+/// Vulkan resources (image, cmd pool, fence, descriptor set) and has a
+/// lifecycle `Free → InFlight → Loaded → Free (on eviction)`.
 struct ComputeSlot {
     /// 3D R8_UINT image — compute shader writes here directly via imageStore.
-    /// Usage: STORAGE (compute write) + SAMPLED (Phase 3 renderer read) +
-    /// TRANSFER_SRC (Phase 1 readback path).
+    /// Usage: STORAGE (compute write) + SAMPLED (renderer read) +
+    /// TRANSFER_SRC (sync readback path used only by tests).
     output_image: vk::Image,
     output_image_view: vk::ImageView,
     output_image_alloc: Option<Allocation>,
-    /// Host-visible staging buffer that `cmd_copy_image_to_buffer` writes into
-    /// so `try_take_completed` can read the bytes out. Phase 3 will drop this
-    /// and sample the image directly in the renderer.
+    /// Host-visible staging buffer used by the sync `generate_chunk` test
+    /// wrapper and the deprecated `try_take_completed_with_bytes` shim. The
+    /// normal fast path (renderer samples directly) never touches this.
     readback_buffer: AllocatedBuffer,
     descriptor_set: vk::DescriptorSet,
     fence: vk::Fence,
     cmd_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
-    in_use: bool,
+    state: SlotState,
+    /// Frame index at which this slot was last referenced. Used for LRU
+    /// eviction — submit_chunk picks the oldest Loaded slot when the pool
+    /// is full of Loaded entries.
+    last_touched_frame: u64,
     /// True until the first dispatch — used to pick UNDEFINED vs
-    /// TRANSFER_SRC_OPTIMAL as the old layout for the pre-dispatch barrier.
+    /// SHADER_READ_ONLY_OPTIMAL as the old layout for the pre-dispatch barrier.
     first_use: bool,
-    chunk_pos: [i32; 3],
-    request_id: u64,
+    /// Chunk this slot currently represents. Set when `state` transitions
+    /// from Free → InFlight and kept until the slot is re-used. Valid
+    /// whenever `state != Free`.
+    chunk_pos: ChunkKey,
 }
 
 /// Create a CHUNK_SIZE³ R8_UINT 3D image for compute-write + sample + xfer.
@@ -458,10 +482,10 @@ impl TerrainComputePipeline {
                 fence,
                 cmd_pool,
                 cmd,
-                in_use: false,
+                state: SlotState::Free,
+                last_touched_frame: 0,
                 first_use: true,
                 chunk_pos: [0, 0, 0],
-                request_id: 0,
             });
         }
 
@@ -557,21 +581,27 @@ impl TerrainComputePipeline {
     }
 
     /// Wait for all in-flight slots to drain. Used before destroying or
-    /// freeing buffers that slots may reference.
+    /// freeing buffers that slots may reference. Loaded slots are discarded
+    /// to Free because the region plan / rivers they were generated against
+    /// may be about to change.
     fn wait_idle(&mut self, ctx: &VulkanContext) -> Result<()> {
         let device = ctx.device();
         let fences: Vec<vk::Fence> = self
             .slots
             .iter()
-            .filter(|s| s.in_use)
+            .filter(|s| matches!(s.state, SlotState::InFlight(_)))
             .map(|s| s.fence)
             .collect();
         if !fences.is_empty() {
             unsafe { device.wait_for_fences(&fences, true, u64::MAX)? };
         }
         // Mark everything free (callers are about to tear down or re-upload).
+        // The images were last left in SHADER_READ_ONLY_OPTIMAL by a
+        // successful dispatch, so reset first_use to false is not valid —
+        // we just keep first_use as-is and rely on the normal SRO→GENERAL
+        // transition on next submit.
         for slot in self.slots.iter_mut() {
-            slot.in_use = false;
+            slot.state = SlotState::Free;
         }
         Ok(())
     }
@@ -734,18 +764,47 @@ impl TerrainComputePipeline {
         Ok(())
     }
 
-    /// Submit a chunk for GPU generation. Returns Some(id) if a slot was free,
-    /// None if all slots are currently in flight.
+    /// Submit a chunk for GPU generation.
+    ///
+    /// Returns:
+    /// - `Ok(Some(id))` if a new dispatch was submitted.
+    /// - `Ok(None)` if the chunk is already Loaded or InFlight, OR if no
+    ///   slot could be acquired (all slots are InFlight — caller should
+    ///   poll and retry next frame).
     pub fn submit_chunk(
         &mut self,
         ctx: &VulkanContext,
-        chunk_pos: [i32; 3],
+        chunk_pos: ChunkKey,
         seed: u32,
     ) -> Result<Option<u64>> {
-        let slot_idx = match self.slots.iter().position(|s| !s.in_use) {
+        // 1. If this chunk is already known to the pool, no-op.
+        if self
+            .slots
+            .iter()
+            .any(|s| s.state != SlotState::Free && s.chunk_pos == chunk_pos)
+        {
+            return Ok(None);
+        }
+
+        // 2. Find a Free slot, or evict the least-recently-touched Loaded one.
+        let slot_idx = match self.slots.iter().position(|s| s.state == SlotState::Free) {
             Some(i) => i,
-            None => return Ok(None),
+            None => {
+                let oldest = self
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| matches!(s.state, SlotState::Loaded(_)))
+                    .min_by_key(|(_, s)| s.last_touched_frame)
+                    .map(|(i, _)| i);
+                match oldest {
+                    Some(i) => i,
+                    // All slots are InFlight — caller should retry later.
+                    None => return Ok(None),
+                }
+            }
         };
+
         let request_id = self.next_request_id;
         self.next_request_id += 1;
 
@@ -772,9 +831,10 @@ impl TerrainComputePipeline {
             device.begin_command_buffer(slot.cmd, &begin)?;
 
             // Transition storage image -> GENERAL for compute write.
-            // First use: UNDEFINED -> GENERAL. Subsequent: TRANSFER_SRC -> GENERAL
-            // (since last dispatch left it in TRANSFER_SRC_OPTIMAL for the
-            // readback copy).
+            // First use: UNDEFINED -> GENERAL.
+            // Subsequent (slot was Loaded or Free-after-wait_idle):
+            // SHADER_READ_ONLY_OPTIMAL -> GENERAL, since the previous dispatch
+            // left the image sampleable by the renderer.
             let (old_layout, src_access, src_stage) = if slot.first_use {
                 (
                     vk::ImageLayout::UNDEFINED,
@@ -783,9 +843,9 @@ impl TerrainComputePipeline {
                 )
             } else {
                 (
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::AccessFlags::TRANSFER_READ,
-                    vk::PipelineStageFlags::TRANSFER,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags::SHADER_READ,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
                 )
             };
             let barrier_to_general = vk::ImageMemoryBarrier::default()
@@ -836,12 +896,13 @@ impl TerrainComputePipeline {
             let groups = CHUNK_SIZE / 8;
             device.cmd_dispatch(slot.cmd, groups, groups, groups);
 
-            // Transition GENERAL -> TRANSFER_SRC_OPTIMAL for the readback copy.
-            let barrier_to_xfer = vk::ImageMemoryBarrier::default()
+            // Transition GENERAL -> SHADER_READ_ONLY_OPTIMAL so the renderer
+            // can sample the image in subsequent graphics draws.
+            let barrier_to_sro = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(slot.output_image)
@@ -849,14 +910,169 @@ impl TerrainComputePipeline {
             device.cmd_pipeline_barrier(
                 slot.cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier_to_sro],
+            );
+
+            device.end_command_buffer(slot.cmd)?;
+
+            // Reset the fence (will be signaled on submission completion).
+            device.reset_fences(&[slot.fence])?;
+
+            let cmds = [slot.cmd];
+            let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+            device.queue_submit(cq.queue, &[submit], slot.fence)?;
+        }
+
+        slot.state = SlotState::InFlight(request_id);
+        slot.first_use = false;
+        slot.chunk_pos = chunk_pos;
+        Ok(Some(request_id))
+    }
+
+    /// Poll all InFlight slots for completion. Slots whose fence has signaled
+    /// transition from `InFlight` → `Loaded` and are returned in the result.
+    /// Non-blocking.
+    ///
+    /// Unlike Phase 1 this does not read back pixel data — the image stays
+    /// GPU-resident in SHADER_READ_ONLY_OPTIMAL and the renderer samples it
+    /// via `loaded_chunks()`. For the old readback semantics (used by the
+    /// game crate before Phase 3 wires rendering), use
+    /// [`try_take_completed_with_bytes`].
+    pub fn try_take_completed(
+        &mut self,
+        ctx: &VulkanContext,
+    ) -> Result<Vec<(u64, ChunkKey)>> {
+        let device = ctx.device();
+        let mut completed = Vec::new();
+        for slot in self.slots.iter_mut() {
+            let request_id = match slot.state {
+                SlotState::InFlight(id) => id,
+                _ => continue,
+            };
+            let status = unsafe { device.get_fence_status(slot.fence) };
+            match status {
+                Ok(true) => {
+                    slot.state = SlotState::Loaded(slot.chunk_pos);
+                    completed.push((request_id, slot.chunk_pos));
+                }
+                Ok(false) => {
+                    // Still running, leave in-flight.
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(completed)
+    }
+
+    /// DEPRECATED backward-compat wrapper for callers that still expect a
+    /// `(request_id, chunk_pos, bytes)` tuple. Issues an explicit one-shot
+    /// readback per completed slot. Phase 3 of the pool plan will remove
+    /// this once the renderer samples the images directly.
+    pub fn try_take_completed_with_bytes(
+        &mut self,
+        ctx: &VulkanContext,
+    ) -> Result<Vec<(u64, ChunkKey, Vec<u8>)>> {
+        let completed = self.try_take_completed(ctx)?;
+        let mut result = Vec::with_capacity(completed.len());
+        for (req_id, pos) in completed {
+            // Find the slot now in Loaded state for this chunk.
+            let slot_idx = self
+                .slots
+                .iter()
+                .position(|s| matches!(s.state, SlotState::Loaded(p) if p == pos))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("completed chunk {:?} missing from pool", pos)
+                })?;
+            self.read_slot_to_buffer(ctx, slot_idx)?;
+            let bytes = self.slots[slot_idx]
+                .readback_buffer
+                .read_data(0, OUTPUT_BYTES as usize)?;
+            result.push((req_id, pos, bytes));
+        }
+        Ok(result)
+    }
+
+    /// Iterate over all slots currently holding valid chunk data, yielding
+    /// `(chunk_pos, image_view)` pairs. The renderer uses this to build its
+    /// per-frame sampler bind group.
+    pub fn loaded_chunks(&self) -> impl Iterator<Item = (ChunkKey, vk::ImageView)> + '_ {
+        self.slots.iter().filter_map(|s| match s.state {
+            SlotState::Loaded(pos) => Some((pos, s.output_image_view)),
+            _ => None,
+        })
+    }
+
+    /// Mark a Loaded slot as touched this frame. The renderer calls this each
+    /// frame for every chunk it is still sampling, to keep LRU eviction
+    /// accurate. No-op if the chunk is not currently Loaded.
+    pub fn mark_touched(&mut self, chunk_pos: ChunkKey, current_frame: u64) {
+        for s in self.slots.iter_mut() {
+            if let SlotState::Loaded(p) = s.state {
+                if p == chunk_pos {
+                    s.last_touched_frame = current_frame;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// One-shot readback of a slot's image into its host-visible
+    /// `readback_buffer`. Uses the slot's own command pool + fence, which is
+    /// safe because the slot is in Loaded state (its previous dispatch has
+    /// already signaled the fence).
+    ///
+    /// Records: SHADER_READ_ONLY_OPTIMAL → TRANSFER_SRC_OPTIMAL,
+    /// cmd_copy_image_to_buffer, TRANSFER → HOST memory barrier,
+    /// TRANSFER_SRC_OPTIMAL → SHADER_READ_ONLY_OPTIMAL. Submits and waits.
+    fn read_slot_to_buffer(
+        &mut self,
+        ctx: &VulkanContext,
+        slot_idx: usize,
+    ) -> Result<()> {
+        let device = ctx.device();
+        let cq = ctx.compute_queue().context("no compute queue")?;
+        let slot = &mut self.slots[slot_idx];
+
+        let full_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+
+        unsafe {
+            device.reset_command_pool(slot.cmd_pool, vk::CommandPoolResetFlags::empty())?;
+
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device.begin_command_buffer(slot.cmd, &begin)?;
+
+            // SHADER_READ_ONLY_OPTIMAL -> TRANSFER_SRC_OPTIMAL
+            let to_xfer = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(slot.output_image)
+                .subresource_range(full_range);
+            device.cmd_pipeline_barrier(
+                slot.cmd,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[barrier_to_xfer],
+                &[to_xfer],
             );
 
-            // Copy image -> host-visible readback buffer (Phase 1 parity).
+            // Copy image -> readback buffer.
             let copy_region = vk::BufferImageCopy::default()
                 .buffer_offset(0)
                 .buffer_row_length(0)
@@ -881,7 +1097,7 @@ impl TerrainComputePipeline {
                 &[copy_region],
             );
 
-            // Memory barrier so host can read after the fence is signaled.
+            // TRANSFER -> HOST so the CPU read sees the copied bytes.
             let host_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -895,80 +1111,102 @@ impl TerrainComputePipeline {
                 &[],
             );
 
+            // Restore image to SHADER_READ_ONLY_OPTIMAL for future rendering.
+            let back_to_sro = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(slot.output_image)
+                .subresource_range(full_range);
+            device.cmd_pipeline_barrier(
+                slot.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[back_to_sro],
+            );
+
             device.end_command_buffer(slot.cmd)?;
 
-            // Reset the fence (will be signaled on submission completion).
             device.reset_fences(&[slot.fence])?;
-
             let cmds = [slot.cmd];
             let submit = vk::SubmitInfo::default().command_buffers(&cmds);
             device.queue_submit(cq.queue, &[submit], slot.fence)?;
+            device.wait_for_fences(&[slot.fence], true, u64::MAX)?;
         }
 
-        slot.in_use = true;
-        slot.first_use = false;
-        slot.chunk_pos = chunk_pos;
-        slot.request_id = request_id;
-        Ok(Some(request_id))
+        Ok(())
     }
 
-    /// Poll all in-use slots for completion. Returns (request_id, chunk_pos,
-    /// materials) for each slot whose fence is signaled. Non-blocking — if no
-    /// slots are ready, returns an empty Vec.
-    pub fn try_take_completed(
-        &mut self,
-        ctx: &VulkanContext,
-    ) -> Result<Vec<(u64, [i32; 3], Vec<u8>)>> {
-        let device = ctx.device();
-        let mut completed = Vec::new();
-        for slot in self.slots.iter_mut() {
-            if !slot.in_use {
-                continue;
-            }
-            let status = unsafe { device.get_fence_status(slot.fence) };
-            match status {
-                Ok(true) => {
-                    let bytes = slot.readback_buffer.read_data(0, OUTPUT_BYTES as usize)?;
-                    completed.push((slot.request_id, slot.chunk_pos, bytes));
-                    slot.in_use = false;
-                }
-                Ok(false) => {
-                    // Still running, leave in-flight.
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(completed)
-    }
-
-    /// Synchronous wrapper: submits a chunk and spin-polls until it completes.
-    /// Primarily for tests + smoke runs that want a blocking API.
+    /// Synchronous wrapper: submits a chunk, spin-polls until it completes,
+    /// then issues an explicit readback into the host-visible buffer.
+    /// Primarily for tests + smoke runs that want a blocking API with bytes.
     pub fn generate_chunk(
         &mut self,
         ctx: &VulkanContext,
-        chunk_pos: [i32; 3],
+        chunk_pos: ChunkKey,
         seed: u32,
     ) -> Result<Vec<u8>> {
-        // If all slots happen to be in flight, spin briefly until one frees.
+        // 1. Submit. If the chunk is already in the pool this returns None
+        //    even without failure, so handle that case by either re-reading
+        //    from the existing slot (if Loaded) or waiting (if InFlight).
+        //    For simplicity, tests use fresh chunk positions per call so we
+        //    treat None from submit_chunk after retry as a hard error.
         let req_id = loop {
             match self.submit_chunk(ctx, chunk_pos, seed)? {
                 Some(id) => break id,
                 None => {
-                    // Drain anything that may have completed while waiting.
+                    // Chunk might already be in-flight/loaded, or pool is
+                    // full. If it's Loaded already, fall through to readback.
+                    if self
+                        .slots
+                        .iter()
+                        .any(|s| matches!(s.state, SlotState::Loaded(p) if p == chunk_pos))
+                    {
+                        // Skip waiting; use existing loaded slot.
+                        return self.read_loaded_chunk(ctx, chunk_pos);
+                    }
+                    // In-flight: drain then retry.
                     let _ = self.try_take_completed(ctx)?;
                     std::thread::sleep(std::time::Duration::from_micros(100));
                 }
             }
         };
+
+        // 2. Spin-poll until our submission completes.
         loop {
             let completed = self.try_take_completed(ctx)?;
-            for (rid, _cp, bytes) in completed {
-                if rid == req_id {
-                    return Ok(bytes);
-                }
+            if completed.iter().any(|(rid, _)| *rid == req_id) {
+                break;
             }
             std::thread::sleep(std::time::Duration::from_micros(100));
         }
+
+        // 3. Readback into the slot's host-visible buffer, then read it out.
+        self.read_loaded_chunk(ctx, chunk_pos)
+    }
+
+    /// Internal: read a currently-Loaded chunk's materials back to the CPU.
+    fn read_loaded_chunk(
+        &mut self,
+        ctx: &VulkanContext,
+        chunk_pos: ChunkKey,
+    ) -> Result<Vec<u8>> {
+        let slot_idx = self
+            .slots
+            .iter()
+            .position(|s| matches!(s.state, SlotState::Loaded(p) if p == chunk_pos))
+            .ok_or_else(|| anyhow::anyhow!("chunk {:?} not loaded", chunk_pos))?;
+        self.read_slot_to_buffer(ctx, slot_idx)?;
+        let bytes = self.slots[slot_idx]
+            .readback_buffer
+            .read_data(0, OUTPUT_BYTES as usize)?;
+        Ok(bytes)
     }
 
     pub fn destroy(mut self, ctx: &VulkanContext, alloc: &mut VulkanAllocator) {
