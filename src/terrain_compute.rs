@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result};
 use ash::vk;
+use gpu_allocator::vulkan::Allocation;
 
 use crate::vulkan::allocator::{AllocatedBuffer, VulkanAllocator};
 use crate::vulkan::instance::VulkanContext;
@@ -72,14 +73,80 @@ pub struct RiverHeaderGpu {
 /// One in-flight compute dispatch slot. Each slot owns a full set of
 /// per-dispatch Vulkan resources so multiple chunks can be in flight at once.
 struct ComputeSlot {
-    output_buffer: AllocatedBuffer,
+    /// 3D R8_UINT image — compute shader writes here directly via imageStore.
+    /// Usage: STORAGE (compute write) + SAMPLED (Phase 3 renderer read) +
+    /// TRANSFER_SRC (Phase 1 readback path).
+    output_image: vk::Image,
+    output_image_view: vk::ImageView,
+    output_image_alloc: Option<Allocation>,
+    /// Host-visible staging buffer that `cmd_copy_image_to_buffer` writes into
+    /// so `try_take_completed` can read the bytes out. Phase 3 will drop this
+    /// and sample the image directly in the renderer.
+    readback_buffer: AllocatedBuffer,
     descriptor_set: vk::DescriptorSet,
     fence: vk::Fence,
     cmd_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     in_use: bool,
+    /// True until the first dispatch — used to pick UNDEFINED vs
+    /// TRANSFER_SRC_OPTIMAL as the old layout for the pre-dispatch barrier.
+    first_use: bool,
     chunk_pos: [i32; 3],
     request_id: u64,
+}
+
+/// Create a CHUNK_SIZE³ R8_UINT 3D image for compute-write + sample + xfer.
+fn create_chunk_storage_image(
+    ctx: &VulkanContext,
+    alloc: &mut VulkanAllocator,
+) -> Result<(vk::Image, vk::ImageView, Allocation)> {
+    let device = ctx.device();
+    let image_ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_3D)
+        .format(vk::Format::R8_UINT)
+        .extent(vk::Extent3D {
+            width: CHUNK_SIZE,
+            height: CHUNK_SIZE,
+            depth: CHUNK_SIZE,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC,
+        )
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+
+    let image = unsafe { device.create_image(&image_ci, None) }
+        .context("create terrain storage image")?;
+    let mem_req = unsafe { device.get_image_memory_requirements(image) };
+    let allocation = alloc.allocate_image_memory(mem_req)?;
+    unsafe {
+        device
+            .bind_image_memory(image, allocation.memory(), allocation.offset())
+            .context("bind terrain image memory")?;
+    }
+
+    let view_ci = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_3D)
+        .format(vk::Format::R8_UINT)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let view = unsafe { device.create_image_view(&view_ci, None) }
+        .context("create terrain storage image view")?;
+
+    Ok((image, view, allocation))
 }
 
 pub struct TerrainComputePipeline {
@@ -121,16 +188,16 @@ impl TerrainComputePipeline {
         let shader_module = unsafe { device.create_shader_module(&shader_ci, None) }
             .context("create terrain compute shader")?;
 
-        // Descriptor layout: five STORAGE_BUFFER bindings.
-        //   binding 0 = output voxel buffer
-        //   binding 1 = region plan cells
-        //   binding 2 = region plan header
-        //   binding 3 = river points (flat)
-        //   binding 4 = river headers (per-polyline ranges)
+        // Descriptor layout:
+        //   binding 0 = output voxel 3D storage image (R8_UINT)
+        //   binding 1 = region plan cells           (storage buffer)
+        //   binding 2 = region plan header          (storage buffer)
+        //   binding 3 = river points (flat)         (storage buffer)
+        //   binding 4 = river headers               (storage buffer)
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
@@ -186,11 +253,15 @@ impl TerrainComputePipeline {
         .map_err(|(_, e)| e)
         .context("compute pipeline")?[0];
 
-        // Descriptor pool sized for NUM_SLOTS sets × 5 storage buffer bindings.
-        let pool_size = vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count((NUM_SLOTS * 5) as u32);
-        let pool_sizes = [pool_size];
+        // Descriptor pool: NUM_SLOTS sets × (1 storage image + 4 storage buffers).
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(NUM_SLOTS as u32),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count((NUM_SLOTS * 4) as u32),
+        ];
         let pool_ci = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
             .max_sets(NUM_SLOTS as u32);
@@ -292,10 +363,19 @@ impl TerrainComputePipeline {
 
         let mut slots: Vec<ComputeSlot> = Vec::with_capacity(NUM_SLOTS);
         for slot_idx in 0..NUM_SLOTS {
-            // Output buffer (host-visible) for this slot.
-            let output_buffer = alloc
+            // 3D storage image (GPU-local) that the compute shader writes to
+            // via imageStore. Stays resident between dispatches; Phase 3 will
+            // let the renderer sample it directly without the readback path.
+            let (output_image, output_image_view, output_image_alloc) =
+                create_chunk_storage_image(ctx, alloc)
+                    .context("slot output image")?;
+
+            // Host-visible staging buffer for Phase 1 parity readback. The
+            // cmd_copy_image_to_buffer in submit_chunk fills this; Phase 3 can
+            // drop it entirely.
+            let readback_buffer = alloc
                 .allocate_host_visible_buffer(OUTPUT_BYTES)
-                .context("slot output buffer")?;
+                .context("slot readback buffer")?;
 
             // Per-slot command pool so we can reset it independently.
             let cmd_pool_ci = vk::CommandPoolCreateInfo::default()
@@ -319,12 +399,11 @@ impl TerrainComputePipeline {
 
             let descriptor_set = descriptor_sets[slot_idx];
 
-            // Initial descriptor writes: output → slot's own buffer,
+            // Initial descriptor writes: output → slot's own storage image,
             // region + river bindings → placeholders.
-            let output_info = [vk::DescriptorBufferInfo::default()
-                .buffer(output_buffer.buffer())
-                .offset(0)
-                .range(OUTPUT_BYTES)];
+            let output_image_info = [vk::DescriptorImageInfo::default()
+                .image_view(output_image_view)
+                .image_layout(vk::ImageLayout::GENERAL)];
             let cells_info = [vk::DescriptorBufferInfo::default()
                 .buffer(placeholder_cells_buffer.buffer())
                 .offset(0)
@@ -345,8 +424,8 @@ impl TerrainComputePipeline {
                 vk::WriteDescriptorSet::default()
                     .dst_set(descriptor_set)
                     .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&output_info),
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(&output_image_info),
                 vk::WriteDescriptorSet::default()
                     .dst_set(descriptor_set)
                     .dst_binding(1)
@@ -371,12 +450,16 @@ impl TerrainComputePipeline {
             unsafe { device.update_descriptor_sets(&writes, &[]) };
 
             slots.push(ComputeSlot {
-                output_buffer,
+                output_image,
+                output_image_view,
+                output_image_alloc: Some(output_image_alloc),
+                readback_buffer,
                 descriptor_set,
                 fence,
                 cmd_pool,
                 cmd,
                 in_use: false,
+                first_use: true,
                 chunk_pos: [0, 0, 0],
                 request_id: 0,
             });
@@ -672,6 +755,14 @@ impl TerrainComputePipeline {
         let pipeline_layout = self.pipeline_layout;
         let slot = &mut self.slots[slot_idx];
 
+        let full_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+
         unsafe {
             // Reset the command pool so we can re-record into the cmd buffer.
             device.reset_command_pool(slot.cmd_pool, vk::CommandPoolResetFlags::empty())?;
@@ -679,6 +770,43 @@ impl TerrainComputePipeline {
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             device.begin_command_buffer(slot.cmd, &begin)?;
+
+            // Transition storage image -> GENERAL for compute write.
+            // First use: UNDEFINED -> GENERAL. Subsequent: TRANSFER_SRC -> GENERAL
+            // (since last dispatch left it in TRANSFER_SRC_OPTIMAL for the
+            // readback copy).
+            let (old_layout, src_access, src_stage) = if slot.first_use {
+                (
+                    vk::ImageLayout::UNDEFINED,
+                    vk::AccessFlags::empty(),
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                )
+            } else {
+                (
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_READ,
+                    vk::PipelineStageFlags::TRANSFER,
+                )
+            };
+            let barrier_to_general = vk::ImageMemoryBarrier::default()
+                .old_layout(old_layout)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(src_access)
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(slot.output_image)
+                .subresource_range(full_range);
+            device.cmd_pipeline_barrier(
+                slot.cmd,
+                src_stage,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier_to_general],
+            );
+
             device.cmd_bind_pipeline(slot.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(
                 slot.cmd,
@@ -704,23 +832,65 @@ impl TerrainComputePipeline {
                 &push,
             );
 
-            // Dispatch: shader uses 16×8×8 local size; cs/4 strips in x.
-            let cs_words = CHUNK_SIZE / 4;
-            let groups_x = (cs_words + 15) / 16;
-            let groups_y = (CHUNK_SIZE + 7) / 8;
-            let groups_z = (CHUNK_SIZE + 7) / 8;
-            device.cmd_dispatch(slot.cmd, groups_x, groups_y, groups_z);
+            // Dispatch: 8×8×8 local size; one invocation per voxel.
+            let groups = CHUNK_SIZE / 8;
+            device.cmd_dispatch(slot.cmd, groups, groups, groups);
 
-            // Memory barrier so host can read after the fence is signaled.
-            let barrier = vk::MemoryBarrier::default()
+            // Transition GENERAL -> TRANSFER_SRC_OPTIMAL for the readback copy.
+            let barrier_to_xfer = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ);
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(slot.output_image)
+                .subresource_range(full_range);
             device.cmd_pipeline_barrier(
                 slot.cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier_to_xfer],
+            );
+
+            // Copy image -> host-visible readback buffer (Phase 1 parity).
+            let copy_region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width: CHUNK_SIZE,
+                    height: CHUNK_SIZE,
+                    depth: CHUNK_SIZE,
+                });
+            device.cmd_copy_image_to_buffer(
+                slot.cmd,
+                slot.output_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                slot.readback_buffer.buffer(),
+                &[copy_region],
+            );
+
+            // Memory barrier so host can read after the fence is signaled.
+            let host_barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+            device.cmd_pipeline_barrier(
+                slot.cmd,
+                vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
-                &[barrier],
+                &[host_barrier],
                 &[],
                 &[],
             );
@@ -736,6 +906,7 @@ impl TerrainComputePipeline {
         }
 
         slot.in_use = true;
+        slot.first_use = false;
         slot.chunk_pos = chunk_pos;
         slot.request_id = request_id;
         Ok(Some(request_id))
@@ -757,7 +928,7 @@ impl TerrainComputePipeline {
             let status = unsafe { device.get_fence_status(slot.fence) };
             match status {
                 Ok(true) => {
-                    let bytes = slot.output_buffer.read_data(0, OUTPUT_BYTES as usize)?;
+                    let bytes = slot.readback_buffer.read_data(0, OUTPUT_BYTES as usize)?;
                     completed.push((slot.request_id, slot.chunk_pos, bytes));
                     slot.in_use = false;
                 }
@@ -812,10 +983,15 @@ impl TerrainComputePipeline {
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             device.destroy_shader_module(self.shader_module, None);
 
-            for slot in self.slots.drain(..) {
+            for mut slot in self.slots.drain(..) {
                 device.destroy_fence(slot.fence, None);
                 device.destroy_command_pool(slot.cmd_pool, None);
-                alloc.free_buffer(slot.output_buffer);
+                device.destroy_image_view(slot.output_image_view, None);
+                device.destroy_image(slot.output_image, None);
+                if let Some(image_alloc) = slot.output_image_alloc.take() {
+                    alloc.free_allocation(image_alloc);
+                }
+                alloc.free_buffer(slot.readback_buffer);
             }
         }
 

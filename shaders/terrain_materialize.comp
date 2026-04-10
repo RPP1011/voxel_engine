@@ -282,14 +282,13 @@ int surface_height_at(float vx, float vy, uint seed) {
     return int(round(base_height * float(MAX_SURFACE_Z) + detail));
 }
 
-// One invocation per 4-voxel x-strip. With cs=64, x dim = 16 strips.
-// Local size: 16 × 8 × 8 = 1024 (max for most GPUs).
-layout(local_size_x = 16, local_size_y = 8, local_size_z = 8) in;
+// One invocation per voxel. With cs=64, 8x8x8 groups = 8 workgroups per axis.
+// Local size: 8 × 8 × 8 = 512.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
-// Output: u8 material per voxel, packed into uint storage buffer (4 voxels per uint).
-layout(set = 0, binding = 0) buffer OutputBuf {
-    uint voxels[]; // length = chunk_size^3 / 4
-} out_buf;
+// Output: 3D R8_UINT storage image, one material per voxel. Stays resident on
+// GPU so the renderer can sample it directly without a readback roundtrip.
+layout(set = 0, binding = 0, r8ui) uniform writeonly uimage3D out_image;
 
 layout(push_constant) uniform PushConstants {
     ivec4 chunk_pos;       // (cx, cy, cz, _)
@@ -1012,63 +1011,37 @@ vec4 chunk_cave_params(int cs, uint seed) {
 }
 
 void main() {
-    uint cs       = pc.params.y;
-    uint cs_words = cs / 4u; // x dimension divided into 4-voxel strips
+    uint cs = pc.params.y;
 
     uvec3 lp = gl_GlobalInvocationID;
-    if (lp.x >= cs_words || lp.y >= cs || lp.z >= cs) return;
+    if (lp.x >= cs || lp.y >= cs || lp.z >= cs) return;
 
-    uint seed  = pc.params.x;
-    int base_x = pc.chunk_pos.x * int(cs) + int(lp.x) * 4;
-    int vy     = pc.chunk_pos.y * int(cs) + int(lp.y);
-    int vz     = pc.chunk_pos.z * int(cs) + int(lp.z);
+    uint seed = pc.params.x;
+    int vx = pc.chunk_pos.x * int(cs) + int(lp.x);
+    int vy = pc.chunk_pos.y * int(cs) + int(lp.y);
+    int vz = pc.chunk_pos.z * int(cs) + int(lp.z);
 
-    // Each invocation owns 4 consecutive x-voxels → one full uint word (no RMW race).
-    uint m0 = material_at(base_x + 0, vy, vz, seed);
-    uint m1 = material_at(base_x + 1, vy, vz, seed);
-    uint m2 = material_at(base_x + 2, vy, vz, seed);
-    uint m3 = material_at(base_x + 3, vy, vz, seed);
+    uint mat = material_at(vx, vy, vz, seed);
 
     // Cave carving post-pass — chunk-level biome resolved once.
     vec4 cparams = chunk_cave_params(int(cs), seed);
     if (cparams.y > 0.0) {
         int lz_i = int(lp.z);
-        uint o0 = cave_override(base_x + 0, vy, vz, lz_i, m0, seed, cparams);
-        uint o1 = cave_override(base_x + 1, vy, vz, lz_i, m1, seed, cparams);
-        uint o2 = cave_override(base_x + 2, vy, vz, lz_i, m2, seed, cparams);
-        uint o3 = cave_override(base_x + 3, vy, vz, lz_i, m3, seed, cparams);
-        if (o0 != 0xFFFFFFFFu) m0 = o0;
-        if (o1 != 0xFFFFFFFFu) m1 = o1;
-        if (o2 != 0xFFFFFFFFu) m2 = o2;
-        if (o3 != 0xFFFFFFFFu) m3 = o3;
+        uint o = cave_override(vx, vy, vz, lz_i, mat, seed, cparams);
+        if (o != 0xFFFFFFFFu) mat = o;
     }
 
     // River carving post-pass — runs AFTER caves so caves take priority
     // underground. Iterates all uploaded river polylines per voxel.
     {
-        uint r0 = river_override(base_x + 0, vy, vz, m0, seed);
-        uint r1 = river_override(base_x + 1, vy, vz, m1, seed);
-        uint r2 = river_override(base_x + 2, vy, vz, m2, seed);
-        uint r3 = river_override(base_x + 3, vy, vz, m3, seed);
-        if (r0 != 0xFFFFFFFFu) m0 = r0;
-        if (r1 != 0xFFFFFFFFu) m1 = r1;
-        if (r2 != 0xFFFFFFFFu) m2 = r2;
-        if (r3 != 0xFFFFFFFFu) m3 = r3;
+        uint r = river_override(vx, vy, vz, mat, seed);
+        if (r != 0xFFFFFFFFu) mat = r;
     }
 
     // Surface features post-pass — trees, boulders, pillars. Must run after
     // caves and rivers to match CPU order. Very expensive (per-voxel column
     // scan); relies on early-outs in apply_features to stay tractable.
-    {
-        m0 = apply_features(base_x + 0, vy, vz, m0, seed);
-        m1 = apply_features(base_x + 1, vy, vz, m1, seed);
-        m2 = apply_features(base_x + 2, vy, vz, m2, seed);
-        m3 = apply_features(base_x + 3, vy, vz, m3, seed);
-    }
+    mat = apply_features(vx, vy, vz, mat, seed);
 
-    uint packed = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24);
-
-    // word_idx: stride in x is cs/4 words; y and z use full cs stride.
-    uint word_idx = (lp.z * cs * cs + lp.y * cs) / 4u + lp.x;
-    out_buf.voxels[word_idx] = packed;
+    imageStore(out_image, ivec3(int(lp.x), int(lp.y), int(lp.z)), uvec4(mat, 0u, 0u, 0u));
 }
