@@ -83,6 +83,16 @@ float hash_f32_u64(int x, int y, int z, uint seed) {
     return float(hash_3d_u64(x, y, z, s)) / 4294967295.0;
 }
 
+// Widen a u32 seed to u64 as uvec2(hi=0, lo=seed).
+uvec2 widen_seed(uint seed) {
+    return uvec2(0u, seed);
+}
+
+// hash_f32_u64 with a u64 seed expressed as uvec2(hi, lo).
+float hash_f32_u64_full(int x, int y, int z, uvec2 seed) {
+    return float(hash_3d_u64(x, y, z, seed)) / 4294967295.0;
+}
+
 float smoothstep_t(float t) {
     return t * t * (3.0 - 2.0 * t);
 }
@@ -342,14 +352,18 @@ uint ore_at(int vx, int vy, int vz, uint seed, float ore_boost) {
 // ---------------------------------------------------------------------------
 //
 // SubBiome discriminants — must match src/world_sim/state.rs::SubBiome::to_u32.
-const uint SUB_STANDARD      = 0u;
-const uint SUB_NATURAL_CAVE  = 9u;
-const uint SUB_LAVA_TUBES    = 10u;
-const uint SUB_FROZEN_CAVERN = 11u;
+const uint SUB_STANDARD       = 0u;
+const uint SUB_LIGHT_FOREST   = 1u;
+const uint SUB_DENSE_FOREST   = 2u;
+const uint SUB_ANCIENT_FOREST = 3u;
+const uint SUB_TEMPLE_JUNGLE  = 8u;
+const uint SUB_NATURAL_CAVE   = 9u;
+const uint SUB_LAVA_TUBES     = 10u;
+const uint SUB_FROZEN_CAVERN  = 11u;
 const uint SUB_MUSHROOM_GROVE = 12u;
-const uint SUB_CRYSTAL_VEIN  = 13u;
-const uint SUB_AQUIFER       = 14u;
-const uint SUB_BONE_OSSUARY  = 15u;
+const uint SUB_CRYSTAL_VEIN   = 13u;
+const uint SUB_AQUIFER        = 14u;
+const uint SUB_BONE_OSSUARY   = 15u;
 
 // Material ids referenced by cave fills. Matches VoxelMaterial enum repr.
 const uint MAT_WATER = 8u;
@@ -562,6 +576,296 @@ uint river_override(int vx, int vy, int vz, uint base_mat, uint seed) {
     return 0xFFFFFFFFu;
 }
 
+// ---------------------------------------------------------------------------
+// Surface features — mirrors Rust terrain/features.rs.
+// ---------------------------------------------------------------------------
+//
+// The CPU iterates every column in the chunk, runs a per-column density hash,
+// and if it passes, stamps a tree/boulder/pillar shape with bounds-clipping to
+// the chunk. On GPU we reverse this: for each voxel we iterate the chunk's
+// columns, run the same density check, and test if the voxel falls inside
+// the feature's footprint. Very expensive (O(voxels * columns)) but bounded
+// by aggressive early-outs on the voxel's distance from the surface and from
+// each column (dx² + dy² vs max feature footprint radius).
+
+// Material ids referenced by features.
+const uint MAT_WOOD_LOG = 17u;
+
+// Salt constants as uvec2(lo, hi) matching Rust u64 values.
+// e.g. 0x7777_1234_0001 = (lo=0x12340001, hi=0x00007777).
+const uvec2 SALT_TREE_DENSITY    = uvec2(0x00007777u, 0x12340001u);
+const uvec2 SALT_TREE_HEIGHT     = uvec2(0x0000AAAAu, 0x12340002u);
+const uvec2 SALT_BOULDER_DENSITY = uvec2(0x0000CCCCu, 0x56780001u);
+const uvec2 SALT_BOULDER_SIZE    = uvec2(0x0000DDDDu, 0x56780002u);
+const uvec2 SALT_PILLAR_DENSITY  = uvec2(0x0000EEEEu, 0x56780003u);
+const uvec2 SALT_PILLAR_HEIGHT   = uvec2(0x0000FFFFu, 0x56780004u);
+
+// Add a u32 seed (widened to u64) to a u64 salt. Returns uvec2(hi, lo).
+uvec2 seed_plus_salt(uint seed, uvec2 salt) {
+    return u64_add(widen_seed(seed), salt);
+}
+
+// Maximum footprint radii (must conservatively bound the largest shape).
+// Tree canopy: 20 + 10 = 30 max radius (large trees). dx²+dy² up to 900.
+// Also the canopy extends up to 30 above trunk top. Trunk top can be at
+// base_z + 120. So max vertical extent above surface ≈ 150.
+// Boulder: up to size=10 (forward AABB). Pillar: radius up to 5, height up to 60.
+const int FEATURE_MAX_RADIUS_SQ = 900; // 30²
+const int FEATURE_MAX_Z_ABOVE   = 160; // head-room above surface
+const int FEATURE_MAX_Z_BELOW   = 5;   // features clipped to surface; trunk base = surface+1
+
+struct FeatureParams {
+    float tree_density;
+    float boulder_density;
+    float pillar_density;
+    uint  pillar_material;
+    uint  canopy_material;
+};
+
+FeatureParams feature_params(uint terrain, uint sub_biome) {
+    FeatureParams p;
+    p.tree_density = 0.0;
+    p.boulder_density = 0.0;
+    p.pillar_density = 0.0;
+    p.pillar_material = 2u;   // Stone
+    p.canopy_material = 42u;  // Leaves (default)
+
+    // Tree density per biome (matches Rust feature_params).
+    if (terrain == 1u) { // Forest
+        if (sub_biome == SUB_DENSE_FOREST)   p.tree_density = 0.004;
+        else if (sub_biome == SUB_LIGHT_FOREST) p.tree_density = 0.001;
+        else if (sub_biome == SUB_ANCIENT_FOREST) p.tree_density = 0.002;
+        else p.tree_density = 0.002;
+    } else if (terrain == 9u) { // Jungle
+        if (sub_biome == SUB_TEMPLE_JUNGLE) p.tree_density = 0.005;
+        else p.tree_density = 0.006;
+    } else if (terrain == 6u) { p.tree_density = 0.0005; } // Tundra
+    else if (terrain == 4u) { p.tree_density = 0.002; }    // Swamp
+    else if (terrain == 2u) { p.tree_density = 0.0003; }   // Mountains
+    else if (terrain == 0u) { p.tree_density = 0.0003; }   // Plains
+
+    // Boulder density.
+    if (terrain == 0u)       p.boulder_density = 0.01;   // Plains
+    else if (terrain == 5u)  p.boulder_density = 0.02;   // Desert
+    else if (terrain == 12u) p.boulder_density = 0.02;   // Badlands
+    else if (terrain == 6u)  p.boulder_density = 0.008;  // Tundra
+    else if (terrain == 2u)  p.boulder_density = 0.02;   // Mountains
+
+    // Pillar density + material.
+    if (terrain == 5u) {
+        p.pillar_density = 0.008;
+        p.pillar_material = 27u; // Sandstone
+    } else if (terrain == 12u) {
+        p.pillar_density = 0.012;
+        p.pillar_material = 39u; // RedSand
+    }
+
+    // Canopy material per biome.
+    if (terrain == 9u)      p.canopy_material = 37u; // Jungle → JungleMoss
+    else if (terrain == 4u) p.canopy_material = 42u; // Swamp → Leaves
+    else                    p.canopy_material = 42u; // Default → Leaves
+
+    return p;
+}
+
+// Try to place a tree at origin (ox,oy) and test whether it covers (vx,vy,vz).
+// Returns the override material or 0xFFFFFFFFu if not covered.
+// `is_trunk` out-param flags whether the covered voxel is a trunk voxel (used
+// by canopy to skip overwriting the trunk — matches Rust).
+uint try_tree_at(int ox, int oy, int vx, int vy, int vz, int feature_base_z,
+                 uint seed, FeatureParams fp, out bool covered_by_trunk) {
+    covered_by_trunk = false;
+
+    // Density check.
+    float td = hash_f32_u64_full(ox, oy, 0, seed_plus_salt(seed, SALT_TREE_DENSITY));
+    // Cluster noise (u32 fbm_2d path — uses u32 seed directly).
+    float cluster = fbm_2d(float(ox) * 0.025, float(oy) * 0.025,
+                           seed + 0xC1C1u, 2, 2.0, 0.5);
+    float effective_density = fp.tree_density * (0.3 + cluster * 1.4);
+    if (td >= effective_density) return 0xFFFFFFFFu;
+
+    // Size (matches Rust stamp_tree_biome).
+    float size_hash = hash_f32_u64_full(ox, oy, 5, seed_plus_salt(seed, SALT_TREE_HEIGHT));
+    float h_hash    = hash_f32_u64_full(ox, oy, 0, seed_plus_salt(seed, SALT_TREE_HEIGHT));
+
+    int trunk_height;
+    int trunk_radius;
+    int canopy_r;
+    if (size_hash < 0.2) {
+        trunk_height = 10 + int(h_hash * 10.0);
+        trunk_radius = 1;
+        canopy_r     = 5 + int(h_hash * 3.0);
+    } else if (size_hash > 0.8) {
+        trunk_height = 80 + int(h_hash * 40.0);
+        trunk_radius = 2;
+        canopy_r     = 20 + int(h_hash * 10.0);
+    } else {
+        trunk_height = 40 + int(h_hash * 30.0);
+        trunk_radius = 1 + int(h_hash * 1.5);
+        canopy_r     = 12 + int(h_hash * 6.0);
+    }
+
+    int dx = vx - ox;
+    int dy = vy - oy;
+
+    // Trunk (cylinder from feature_base_z up trunk_height).
+    int dz_trunk = vz - feature_base_z;
+    if (dz_trunk >= 0 && dz_trunk < trunk_height) {
+        int r2 = trunk_radius * trunk_radius + 1;
+        if (dx * dx + dy * dy <= r2) {
+            covered_by_trunk = true;
+            return MAT_WOOD_LOG;
+        }
+    }
+
+    // Canopy sphere centered at feature_base_z + trunk_height.
+    int cdz = vz - (feature_base_z + trunk_height);
+    if (dx * dx + dy * dy + cdz * cdz <= canopy_r * canopy_r) {
+        return fp.canopy_material;
+    }
+
+    return 0xFFFFFFFFu;
+}
+
+// Boulder: axis-aligned cube of Stone with origin at (ox,oy,feature_base_z),
+// extents size×size×size forward in +x,+y,+z.
+uint try_boulder_at(int ox, int oy, int vx, int vy, int vz, int feature_base_z,
+                    uint seed, FeatureParams fp) {
+    float bd = hash_f32_u64_full(ox, oy, 0, seed_plus_salt(seed, SALT_BOULDER_DENSITY));
+    if (bd >= fp.boulder_density) return 0xFFFFFFFFu;
+
+    float s_hash = hash_f32_u64_full(ox, oy, 2, seed_plus_salt(seed, SALT_BOULDER_SIZE));
+    int size = 3 + int(s_hash * 8.0);
+
+    int dx = vx - ox;
+    int dy = vy - oy;
+    int dz = vz - feature_base_z;
+    if (dx >= 0 && dx < size && dy >= 0 && dy < size && dz >= 0 && dz < size) {
+        return 2u; // Stone
+    }
+    return 0xFFFFFFFFu;
+}
+
+// Pillar: cylindrical column centered at (ox,oy), base at feature_base_z,
+// height and radius hashed from PILLAR_HEIGHT_SALT.
+uint try_pillar_at(int ox, int oy, int vx, int vy, int vz, int feature_base_z,
+                   uint seed, FeatureParams fp) {
+    float pd = hash_f32_u64_full(ox, oy, 0, seed_plus_salt(seed, SALT_PILLAR_DENSITY));
+    if (pd >= fp.pillar_density) return 0xFFFFFFFFu;
+
+    float h_hash = hash_f32_u64_full(ox, oy, 3, seed_plus_salt(seed, SALT_PILLAR_HEIGHT));
+    int height = 20 + int(h_hash * 40.0);
+    int radius = 3 + int(h_hash * 3.0);
+
+    int dx = vx - ox;
+    int dy = vy - oy;
+    int dz = vz - feature_base_z;
+    if (dz < 0 || dz >= height) return 0xFFFFFFFFu;
+    int r2 = radius * radius + 1;
+    if (dx * dx + dy * dy > r2) return 0xFFFFFFFFu;
+    return fp.pillar_material;
+}
+
+// Apply surface feature overrides for (vx,vy,vz) using chunk-center biome.
+// Returns the new material, or base_mat if no feature applies.
+uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
+    int cs = int(pc.params.y);
+    int base_x = pc.chunk_pos.x * cs;
+    int base_y = pc.chunk_pos.y * cs;
+    int base_z = pc.chunk_pos.z * cs;
+
+    // Chunk-center biome — CPU uses chunk-center cell, not per-voxel.
+    int ccx = base_x + cs / 2;
+    int ccy = base_y + cs / 2;
+    RegionCell center_cell = sample_cell(float(ccx), float(ccy));
+    int center_surface_z = surface_height_at(float(ccx), float(ccy), seed);
+    int surface_z_local = center_surface_z - base_z;
+    if (surface_z_local < -10 || surface_z_local >= cs + 10) return base_mat;
+
+    FeatureParams fp = feature_params(center_cell.terrain, center_cell.sub_biome);
+    if (fp.tree_density == 0.0 && fp.boulder_density == 0.0 && fp.pillar_density == 0.0) {
+        return base_mat;
+    }
+
+    // Early-out: skip voxels far from this voxel's own surface. Features sit
+    // 1 voxel above the per-column surface with max vertical reach ~160.
+    int my_surface_z = surface_height_at(float(vx), float(vy), seed);
+    if (vz < my_surface_z - FEATURE_MAX_Z_BELOW || vz > my_surface_z + FEATURE_MAX_Z_ABOVE) {
+        return base_mat;
+    }
+
+    // Restrict column search to a bounding box of max feature radius. This is
+    // a conservative radius; the inner per-feature tests still enforce exact
+    // shape. Clip to chunk bounds (CPU only stamps from in-chunk origins).
+    int vlx = vx - base_x;
+    int vly = vy - base_y;
+    int rmax = 30; // max tree canopy radius
+    int olx_min = max(0, vlx - rmax);
+    int olx_max = min(cs - 1, vlx + rmax);
+    int oly_min = max(0, vly - rmax);
+    int oly_max = min(cs - 1, vly + rmax);
+
+    uint mat = base_mat;
+    bool mat_is_trunk = false; // track if current mat came from a trunk voxel
+
+    for (int oly = oly_min; oly <= oly_max; oly++) {
+        for (int olx = olx_min; olx <= olx_max; olx++) {
+            int ox = base_x + olx;
+            int oy = base_y + oly;
+
+            int dx = vx - ox;
+            int dy = vy - oy;
+            int d2 = dx * dx + dy * dy;
+            if (d2 > FEATURE_MAX_RADIUS_SQ) continue;
+
+            // Per-column surface (expensive FBM call).
+            int col_surface_z = surface_height_at(float(ox), float(oy), seed);
+            int feature_base_z = col_surface_z + 1;
+            int local_z = feature_base_z - base_z;
+            // CPU skips columns whose feature base isn't in this chunk.
+            if (local_z < 0 || local_z >= cs) continue;
+
+            // Trees first (CPU order).
+            if (fp.tree_density > 0.0) {
+                bool trunk_hit;
+                uint tm = try_tree_at(ox, oy, vx, vy, vz, feature_base_z, seed, fp, trunk_hit);
+                if (tm != 0xFFFFFFFFu) {
+                    // CPU canopy rule: canopy does NOT overwrite trunk voxels.
+                    // On GPU, if a previous iteration marked us as a trunk and
+                    // this iteration is a canopy hit, skip the overwrite.
+                    if (!trunk_hit && mat_is_trunk) {
+                        // keep trunk
+                    } else {
+                        mat = tm;
+                        mat_is_trunk = trunk_hit;
+                    }
+                }
+            }
+
+            // Boulder (CPU writes unconditionally — no skip for tree columns
+            // since CPU feature.rs doesn't track per-column state either).
+            if (fp.boulder_density > 0.0) {
+                uint bm = try_boulder_at(ox, oy, vx, vy, vz, feature_base_z, seed, fp);
+                if (bm != 0xFFFFFFFFu) {
+                    mat = bm;
+                    mat_is_trunk = false;
+                }
+            }
+
+            // Pillar.
+            if (fp.pillar_density > 0.0) {
+                uint pm = try_pillar_at(ox, oy, vx, vy, vz, feature_base_z, seed, fp);
+                if (pm != 0xFFFFFFFFu) {
+                    mat = pm;
+                    mat_is_trunk = false;
+                }
+            }
+        }
+    }
+
+    return mat;
+}
+
 uint material_at(int vx, int vy, int vz, uint seed) {
     RegionCell cell = sample_cell(float(vx), float(vy));
     uint terrain = cell.terrain;
@@ -750,6 +1054,16 @@ void main() {
         if (r1 != 0xFFFFFFFFu) m1 = r1;
         if (r2 != 0xFFFFFFFFu) m2 = r2;
         if (r3 != 0xFFFFFFFFu) m3 = r3;
+    }
+
+    // Surface features post-pass — trees, boulders, pillars. Must run after
+    // caves and rivers to match CPU order. Very expensive (per-voxel column
+    // scan); relies on early-outs in apply_features to stay tractable.
+    {
+        m0 = apply_features(base_x + 0, vy, vz, m0, seed);
+        m1 = apply_features(base_x + 1, vy, vz, m1, seed);
+        m2 = apply_features(base_x + 2, vy, vz, m2, seed);
+        m3 = apply_features(base_x + 3, vy, vz, m3, seed);
     }
 
     uint packed = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24);
