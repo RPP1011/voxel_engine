@@ -1,0 +1,34 @@
+#version 450
+
+// 2x2x2 OR-downsample of an R8_UINT chunk volume. Output voxel is non-zero
+// iff any of the 8 corresponding input voxels is non-zero. The gbuffer.frag
+// raycaster uses these mips for empty-space skipping.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(set = 0, binding = 0, r8ui) uniform readonly uimage3D in_image;
+layout(set = 0, binding = 1, r8ui) uniform writeonly uimage3D out_image;
+
+layout(push_constant) uniform PushConstants {
+    uvec4 out_dim; // (out_w, out_h, out_d, _)
+} pc;
+
+void main() {
+    uvec3 out_coord = gl_GlobalInvocationID;
+    if (out_coord.x >= pc.out_dim.x ||
+        out_coord.y >= pc.out_dim.y ||
+        out_coord.z >= pc.out_dim.z) {
+        return;
+    }
+
+    ivec3 in_base = ivec3(out_coord) * 2;
+    uint acc = 0u;
+    for (int dz = 0; dz < 2; dz++) {
+        for (int dy = 0; dy < 2; dy++) {
+            for (int dx = 0; dx < 2; dx++) {
+                acc |= imageLoad(in_image, in_base + ivec3(dx, dy, dz)).r;
+            }
+        }
+    }
+    imageStore(out_image, ivec3(out_coord), uvec4(acc, 0u, 0u, 0u));
+}

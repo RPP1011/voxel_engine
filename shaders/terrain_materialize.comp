@@ -1043,5 +1043,10 @@ void main() {
     // scan); relies on early-outs in apply_features to stay tractable.
     mat = apply_features(vx, vy, vz, mat, seed);
 
-    imageStore(out_image, ivec3(int(lp.x), int(lp.y), int(lp.z)), uvec4(mat, 0u, 0u, 0u));
+    // NOTE: storage layout is engine-oriented (x, y-up, z) to match what the
+    // renderer's gbuffer raycaster expects. The compute thread lp is in sim
+    // local coords where lp.z is the vertical axis, so we swap Y↔Z on store.
+    // Readback consumers (parity tests, sync generate_chunk) must apply the
+    // same swap when indexing the returned bytes.
+    imageStore(out_image, ivec3(int(lp.x), int(lp.z), int(lp.y)), uvec4(mat, 0u, 0u, 0u));
 }

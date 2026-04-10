@@ -1,11 +1,13 @@
 use anyhow::Result;
 use ash::vk;
+use ash::vk::Handle;
 
 use crate::vulkan::gbuffer::GBuffer;
 use crate::vulkan::graphics_pipeline::{GraphicsPipeline, GraphicsPipelineBuilder};
 use crate::vulkan::instance::VulkanContext;
 use crate::vulkan::render_target::OffscreenTarget;
 use crate::vulkan::shadow_map::ShadowMap;
+use crate::terrain_compute::LoadedChunkView;
 use crate::vulkan::voxel_gpu::GpuVoxelTexture;
 
 use crate::camera::OrbitCamera;
@@ -57,16 +59,16 @@ pub struct VoxelRenderer {
     obj_desc_pool: Option<vk::DescriptorPool>,
     obj_gbuf_desc_sets: Vec<vk::DescriptorSet>,
     obj_shadow_desc_set: Option<vk::DescriptorSet>,
-    /// Number of image views that were used to build the cached descriptor sets.
-    /// When this changes (scene switch), we rebuild.
-    cached_obj_count: usize,
+    /// Hash of image view handles used to build the cached descriptor sets.
+    /// When this changes (texture upload/evict), we rebuild.
+    cached_obj_hash: u64,
     voxel_sampler: vk::Sampler,
     // Pre-allocated Vulkan objects to avoid per-frame alloc/free
     render_cmd: [vk::CommandBuffer; 2],
     render_fence: vk::Fence,
     frame_index: usize,
     // Reusable per-frame Vec buffers (cleared each frame, capacity preserved)
-    batch_push_buf: Vec<[u8; 160]>,
+    batch_push_buf: Vec<[u8; 176]>,
 }
 
 impl VoxelRenderer {
@@ -103,13 +105,14 @@ impl VoxelRenderer {
             .vertex_shader(gbuffer_vert_spv)
             .fragment_shader(gbuffer_frag_spv)
             .render_pass(gbuffer.render_pass)
-            .push_constant_size(160, vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .push_constant_size(176, vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .descriptor(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, vk::ShaderStageFlags::FRAGMENT)
             .descriptor(1, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, vk::ShaderStageFlags::FRAGMENT)
             .descriptor(2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, vk::ShaderStageFlags::FRAGMENT)
             .descriptor(3, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, vk::ShaderStageFlags::FRAGMENT)
+            .descriptor(4, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, vk::ShaderStageFlags::FRAGMENT)
             .color_attachment_count(5)
-            .cull_mode(vk::CullModeFlags::NONE) // allow camera inside voxel volumes
+            .cull_mode(vk::CullModeFlags::NONE) // no HW culling; back faces discarded in frag shader
             .build()?;
 
         // Build shadow pipeline (reuses gbuffer.vert + shadow_map.frag)
@@ -262,7 +265,7 @@ impl VoxelRenderer {
             obj_desc_pool: None,
             obj_gbuf_desc_sets: Vec::new(),
             obj_shadow_desc_set: None,
-            cached_obj_count: 0,
+            cached_obj_hash: 0,
             voxel_sampler,
             render_cmd,
             render_fence,
@@ -272,12 +275,25 @@ impl VoxelRenderer {
     }
 
     /// Rebuild cached per-object descriptor sets when the object list changes.
-    /// Call this once at scene setup or when objects are added/removed.
+    /// Skips rebuild if the same set of textures is passed as last time.
     fn rebuild_object_descriptors(
         &mut self,
         ctx: &VulkanContext,
         objects: &[(&GpuVoxelTexture, [f32; 4], [f32; 3], [f32; 3])],
     ) -> Result<()> {
+        // Hash the image view handles to detect changes (FNV-1a style).
+        let mut obj_hash: u64 = 0xcbf29ce484222325;
+        obj_hash ^= objects.len() as u64;
+        obj_hash = obj_hash.wrapping_mul(0x100000001b3);
+        for (tex, _, _, _) in objects {
+            // Use the raw Vulkan handle as a unique ID for each texture.
+            obj_hash ^= tex.image_view.as_raw() as u64;
+            obj_hash = obj_hash.wrapping_mul(0x100000001b3);
+        }
+        if obj_hash == self.cached_obj_hash && self.obj_desc_pool.is_some() {
+            return Ok(());
+        }
+
         let device = ctx.device();
 
         // Destroy old pool if it exists (frees all sets allocated from it)
@@ -289,11 +305,11 @@ impl VoxelRenderer {
 
         let obj_count = objects.len().max(1) as u32;
 
-        // Need: obj_count gbuffer sets (4 samplers each) + 1 shadow set (1 sampler)
+        // Need: obj_count gbuffer sets (5 samplers each) + 1 shadow set (1 sampler)
         let pool = {
             let ps = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(obj_count * 4 + 1)];
+                .descriptor_count(obj_count * 5 + 1)];
             unsafe {
                 device.create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
@@ -333,8 +349,12 @@ impl VoxelRenderer {
                     .sampler(self.sampler)
                     .image_view(gpu_tex.palette_view)
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                vk::DescriptorImageInfo::default()
+                    .sampler(self.voxel_sampler)
+                    .image_view(gpu_tex.mip3_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
             ];
-            let writes: Vec<vk::WriteDescriptorSet> = (0..4)
+            let writes: Vec<vk::WriteDescriptorSet> = (0..5)
                 .map(|i| {
                     vk::WriteDescriptorSet::default()
                         .dst_set(desc_set)
@@ -373,7 +393,7 @@ impl VoxelRenderer {
         }
 
         self.obj_desc_pool = Some(pool);
-        self.cached_obj_count = objects.len();
+        self.cached_obj_hash = obj_hash;
 
         Ok(())
     }
@@ -406,7 +426,7 @@ impl VoxelRenderer {
             let mv = mat4_mul(&view, &model);
             let mvp = mat4_mul(&proj, &mv);
 
-            let mut push_data = [0u8; 160];
+            let mut push_data = [0u8; 176];
             push_data[0..64].copy_from_slice(bytemuck::cast_slice(&mvp));
             let grid_dim_v = [dims[0], dims[1], dims[2], 0.0f32];
             push_data[64..80].copy_from_slice(bytemuck::cast_slice(&grid_dim_v));
@@ -417,6 +437,8 @@ impl VoxelRenderer {
             push_data[112..128].copy_from_slice(bytemuck::cast_slice(&mip1_dim_v));
             let mip2_dim_v = [gpu_tex.mip2_width as f32, gpu_tex.mip2_height as f32, gpu_tex.mip2_depth as f32, 0.0f32];
             push_data[128..144].copy_from_slice(bytemuck::cast_slice(&mip2_dim_v));
+            let mip3_dim_v = [gpu_tex.mip3_width as f32, gpu_tex.mip3_height as f32, gpu_tex.mip3_depth as f32, 0.0f32];
+            push_data[144..160].copy_from_slice(bytemuck::cast_slice(&mip3_dim_v));
 
             self.batch_push_buf.push(push_data);
         }
@@ -539,7 +561,7 @@ impl VoxelRenderer {
             let mv = mat4_mul(&view, &model);
             let mvp = mat4_mul(&proj, &mv);
 
-            let mut push_data = [0u8; 160];
+            let mut push_data = [0u8; 176];
             push_data[0..64].copy_from_slice(bytemuck::cast_slice(&mvp));
             let grid_dim_v = [dims[0], dims[1], dims[2], 0.0f32];
             push_data[64..80].copy_from_slice(bytemuck::cast_slice(&grid_dim_v));
@@ -550,6 +572,8 @@ impl VoxelRenderer {
             push_data[112..128].copy_from_slice(bytemuck::cast_slice(&mip1_dim_v));
             let mip2_dim_v = [gpu_tex.mip2_width as f32, gpu_tex.mip2_height as f32, gpu_tex.mip2_depth as f32, 0.0f32];
             push_data[128..144].copy_from_slice(bytemuck::cast_slice(&mip2_dim_v));
+            let mip3_dim_v = [gpu_tex.mip3_width as f32, gpu_tex.mip3_height as f32, gpu_tex.mip3_depth as f32, 0.0f32];
+            push_data[144..160].copy_from_slice(bytemuck::cast_slice(&mip3_dim_v));
 
             self.batch_push_buf.push(push_data);
         }
@@ -628,6 +652,262 @@ impl VoxelRenderer {
         );
 
         // End and submit using pre-allocated fence
+        unsafe {
+            device.end_command_buffer(cmd)?;
+            let cmds = [cmd];
+            let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+            device.queue_submit(gq.queue, &[submit], self.render_fence)?;
+            device.wait_for_fences(&[self.render_fence], true, u64::MAX)?;
+        }
+        self.frame_index += 1;
+
+        Ok(())
+    }
+
+    /// Rebuild cached per-object descriptor sets from pool-resident
+    /// [`LoadedChunkView`]s. Mirrors [`rebuild_object_descriptors`] but reads
+    /// image views from the pool struct and uses a shared palette view
+    /// instead of per-object palettes.
+    fn rebuild_pool_descriptors(
+        &mut self,
+        ctx: &VulkanContext,
+        views: &[(LoadedChunkView, [f32; 4], [f32; 3], [f32; 3])],
+        palette_view: vk::ImageView,
+    ) -> Result<()> {
+        // Hash: palette + all main/mip image views.
+        let mut obj_hash: u64 = 0xcbf29ce484222325;
+        obj_hash ^= views.len() as u64;
+        obj_hash = obj_hash.wrapping_mul(0x100000001b3);
+        obj_hash ^= palette_view.as_raw() as u64;
+        obj_hash = obj_hash.wrapping_mul(0x100000001b3);
+        for (v, _, _, _) in views {
+            obj_hash ^= v.main_view.as_raw() as u64;
+            obj_hash = obj_hash.wrapping_mul(0x100000001b3);
+        }
+        if obj_hash == self.cached_obj_hash && self.obj_desc_pool.is_some() {
+            return Ok(());
+        }
+
+        let device = ctx.device();
+
+        if let Some(pool) = self.obj_desc_pool.take() {
+            unsafe { device.destroy_descriptor_pool(pool, None) };
+        }
+        self.obj_gbuf_desc_sets.clear();
+        self.obj_shadow_desc_set = None;
+
+        let obj_count = views.len().max(1) as u32;
+
+        let pool = {
+            let ps = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(obj_count * 5 + 1)];
+            unsafe {
+                device.create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(obj_count + 1)
+                        .pool_sizes(&ps),
+                    None,
+                )
+            }?
+        };
+
+        let gbuf_dsl = self.gbuffer_pipeline.descriptor_set_layout.unwrap();
+        for (v, _palette_color, _position, _grid_dims) in views.iter() {
+            let layouts = [gbuf_dsl];
+            let desc_set = unsafe {
+                device.allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(pool)
+                        .set_layouts(&layouts),
+                )
+            }?[0];
+
+            // NOTE: binding layout matches gbuffer.frag:
+            //   0 = voxel_grid (main), 1 = mip1, 2 = mip2, 3 = palette, 4 = mip3
+            let img_infos = [
+                vk::DescriptorImageInfo::default()
+                    .sampler(self.voxel_sampler)
+                    .image_view(v.main_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                vk::DescriptorImageInfo::default()
+                    .sampler(self.voxel_sampler)
+                    .image_view(v.mip1_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                vk::DescriptorImageInfo::default()
+                    .sampler(self.voxel_sampler)
+                    .image_view(v.mip2_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                vk::DescriptorImageInfo::default()
+                    .sampler(self.sampler)
+                    .image_view(palette_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                vk::DescriptorImageInfo::default()
+                    .sampler(self.voxel_sampler)
+                    .image_view(v.mip3_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            ];
+            let writes: Vec<vk::WriteDescriptorSet> = (0..5)
+                .map(|i| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(desc_set)
+                        .dst_binding(i as u32)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(std::slice::from_ref(&img_infos[i]))
+                })
+                .collect();
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+
+            self.obj_gbuf_desc_sets.push(desc_set);
+        }
+
+        if let Some((v, _, _, _)) = views.first() {
+            let shadow_dsl = self.shadow_pipeline.descriptor_set_layout.unwrap();
+            let shadow_layouts = [shadow_dsl];
+            let shadow_desc = unsafe {
+                device.allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(pool)
+                        .set_layouts(&shadow_layouts),
+                )
+            }?[0];
+            let shadow_img = [vk::DescriptorImageInfo::default()
+                .sampler(self.voxel_sampler)
+                .image_view(v.main_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let shadow_write = [vk::WriteDescriptorSet::default()
+                .dst_set(shadow_desc)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&shadow_img)];
+            unsafe { device.update_descriptor_sets(&shadow_write, &[]) };
+            self.obj_shadow_desc_set = Some(shadow_desc);
+        }
+
+        self.obj_desc_pool = Some(pool);
+        self.cached_obj_hash = obj_hash;
+
+        Ok(())
+    }
+
+    /// Render all passes on the GPU sampling from pool-resident
+    /// [`LoadedChunkView`] textures. Same contract as
+    /// [`render_frame_gpu`] — the result is left in `light_output_image()`
+    /// in TRANSFER_SRC_OPTIMAL, ready for a blit-to-swapchain.
+    ///
+    /// `views` is `(view, palette_color_rgba, world_position, grid_dim)` per
+    /// drawn chunk. `palette_view` is a single 256×1 RGBA image shared by
+    /// every chunk (typically owned by the `TerrainComputePipeline`).
+    pub fn render_frame_pool(
+        &mut self,
+        ctx: &VulkanContext,
+        camera: &impl RenderCamera,
+        views: &[(LoadedChunkView, [f32; 4], [f32; 3], [f32; 3])],
+        palette_view: vk::ImageView,
+    ) -> Result<()> {
+        let aspect = self.width as f32 / self.height as f32;
+        let view_mat = camera.view_matrix_array();
+        let proj = camera.projection_matrix_array(aspect);
+        let eye = camera.eye_position();
+
+        self.rebuild_pool_descriptors(ctx, views, palette_view)?;
+
+        // ---- Build push constants per chunk view ----
+        self.batch_push_buf.clear();
+
+        for (v, palette_color, position, dims) in views.iter() {
+            let model = scale3_translate_matrix(dims[0], dims[1], dims[2], position[0], position[1], position[2]);
+            let mv = mat4_mul(&view_mat, &model);
+            let mvp = mat4_mul(&proj, &mv);
+
+            let mut push_data = [0u8; 176];
+            push_data[0..64].copy_from_slice(bytemuck::cast_slice(&mvp));
+            let grid_dim_v = [dims[0], dims[1], dims[2], 0.0f32];
+            push_data[64..80].copy_from_slice(bytemuck::cast_slice(&grid_dim_v));
+            let cam_pos = [eye[0] - position[0], eye[1] - position[1], eye[2] - position[2], 0.0f32];
+            push_data[80..96].copy_from_slice(bytemuck::cast_slice(&cam_pos));
+            push_data[96..112].copy_from_slice(bytemuck::cast_slice(palette_color));
+            let mip1_dim_v = [v.mip1_dim[0] as f32, v.mip1_dim[1] as f32, v.mip1_dim[2] as f32, 0.0f32];
+            push_data[112..128].copy_from_slice(bytemuck::cast_slice(&mip1_dim_v));
+            let mip2_dim_v = [v.mip2_dim[0] as f32, v.mip2_dim[1] as f32, v.mip2_dim[2] as f32, 0.0f32];
+            push_data[128..144].copy_from_slice(bytemuck::cast_slice(&mip2_dim_v));
+            let mip3_dim_v = [v.mip3_dim[0] as f32, v.mip3_dim[1] as f32, v.mip3_dim[2] as f32, 0.0f32];
+            push_data[144..160].copy_from_slice(bytemuck::cast_slice(&mip3_dim_v));
+
+            self.batch_push_buf.push(push_data);
+        }
+
+        let batch_objects: Vec<(&[u8], vk::DescriptorSet)> = self.batch_push_buf
+            .iter()
+            .zip(self.obj_gbuf_desc_sets.iter())
+            .map(|(p, d)| (p.as_ref(), *d))
+            .collect();
+
+        let device = ctx.device();
+        let gq = ctx.graphics_queue().unwrap();
+
+        let cmd = self.render_cmd[self.frame_index % 2];
+        unsafe {
+            device.wait_for_fences(&[self.render_fence], true, u64::MAX)?;
+            device.reset_fences(&[self.render_fence])?;
+            device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+        }
+
+        // Pass 1: GBuffer
+        self.gbuffer.record_batch(device, cmd, &self.gbuffer_pipeline, &batch_objects);
+
+        // Pass 2: Shadow map (first chunk as representative)
+        if let Some((_v, _palette_color, position, dims)) = views.first() {
+            let max_dim = dims[0].max(dims[1]).max(dims[2]);
+            let sun_dir = normalize_v([0.5, 0.8, 0.3]);
+            let sun_model = scale3_translate_matrix(dims[0], dims[1], dims[2], position[0], position[1], position[2]);
+            let sun_view_mat = build_sun_view(&sun_dir, position, max_dim);
+            let half = max_dim * 2.0;
+            let dist = max_dim * 3.0;
+            let sun_proj = ortho(-half, half, -half, half, 0.1, dist * 2.0);
+            let sun_mvp = mat4_mul(&sun_proj, &mat4_mul(&sun_view_mat, &sun_model));
+            let grid_dim_v = [dims[0], dims[1], dims[2], 0.0f32];
+
+            let mut shadow_push = [0u8; 128];
+            shadow_push[0..64].copy_from_slice(bytemuck::cast_slice(&sun_mvp));
+            shadow_push[64..80].copy_from_slice(bytemuck::cast_slice(&grid_dim_v));
+            let sun_eye = [position[0]+sun_dir[0]*dist, position[1]+sun_dir[1]*dist, position[2]+sun_dir[2]*dist];
+            let sun_cam = [sun_eye[0], sun_eye[1], sun_eye[2], 0.0f32];
+            shadow_push[80..96].copy_from_slice(bytemuck::cast_slice(&sun_cam));
+
+            let shadow_desc = self.obj_shadow_desc_set.unwrap();
+            self.shadow_map.record_render(
+                device, cmd, &self.shadow_pipeline,
+                self.gbuffer.unit_vb(), self.gbuffer.unit_ib(), 36,
+                &shadow_push, shadow_desc,
+            );
+        }
+
+        // Pass 3: Transition GBuffer RTs for sampling
+        self.gbuffer.record_transition_for_sampling(device, cmd);
+
+        // Pass 4: Deferred sun light pass
+        let sun_dir = normalize_v([0.5, 0.8, 0.3]);
+        let center = camera.center();
+        let view_dir = normalize_v([
+            center.x - eye[0],
+            center.y - eye[1],
+            center.z - eye[2],
+        ]);
+        let mut light_push = [0u8; 48];
+        let sun_dir_v = [sun_dir[0], sun_dir[1], sun_dir[2], 2.0f32];
+        let sun_color_v = [1.0f32, 0.95, 0.9, 1.0];
+        let cam_dir_v = [view_dir[0], view_dir[1], view_dir[2], 0.0f32];
+        light_push[0..16].copy_from_slice(bytemuck::cast_slice(&sun_dir_v));
+        light_push[16..32].copy_from_slice(bytemuck::cast_slice(&sun_color_v));
+        light_push[32..48].copy_from_slice(bytemuck::cast_slice(&cam_dir_v));
+
+        self.light_target.record_draw_fullscreen(
+            device, cmd, &self.light_pipeline, &light_push, self.light_desc_set,
+        );
+
         unsafe {
             device.end_command_buffer(cmd)?;
             let cmds = [cmd];
