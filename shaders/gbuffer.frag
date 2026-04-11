@@ -1,5 +1,14 @@
 #version 450
 
+// Force depth test BEFORE fragment shader runs. Without this, the
+// discard statements below force late fragment tests, meaning every
+// occluded fragment still runs the full DDA raymarch before being
+// thrown away. With early_fragment_tests + front-to-back draw order,
+// back chunks that are occluded by front chunks skip the DDA entirely.
+// Safe here because depth is purely rasterizer-interpolated
+// (gl_Position.z from the vertex shader) — we never write gl_FragDepth.
+layout(early_fragment_tests) in;
+
 layout(location = 0) in vec3 frag_entry_pos;
 layout(location = 1) flat in vec3 frag_camera_pos;
 
@@ -13,6 +22,7 @@ layout(set = 0, binding = 0) uniform usampler3D voxel_grid;
 layout(set = 0, binding = 1) uniform usampler3D mip1_grid;
 layout(set = 0, binding = 2) uniform usampler3D mip2_grid;
 layout(set = 0, binding = 3) uniform sampler2D palette_tex; // 256x1 RGBA
+layout(set = 0, binding = 4) uniform usampler3D mip3_grid;
 
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
@@ -21,13 +31,23 @@ layout(push_constant) uniform PushConstants {
     vec4 palette_color;  // .rgb = albedo, .a = roughness
     vec4 mip1_dim;       // xyz = MIP1 dimensions
     vec4 mip2_dim;       // xyz = MIP2 dimensions
+    vec4 mip3_dim;       // xyz = MIP3 dimensions (8x8x8 blocks)
 } pc;
 
 void main() {
     vec3 dim = pc.grid_dim.xyz;
-    // If camera is inside the volume (back-face hit), start ray from camera position.
+    // If camera is inside the volume, start ray from camera position.
     bool camera_inside = all(greaterThanEqual(frag_camera_pos, vec3(0.0)))
                       && all(lessThan(frag_camera_pos, dim));
+
+    // Discard back-face fragments when camera is outside the volume.
+    // gl_FrontFacing is true for front faces (camera-facing).
+    // Back faces from adjacent cubes cause z-fighting; discarding them
+    // eliminates the flickering at chunk boundaries.
+    if (!camera_inside && !gl_FrontFacing) {
+        discard;
+    }
+
     vec3 entry = camera_inside
         ? clamp(frag_camera_pos, vec3(0.001), dim - vec3(0.001))
         : clamp(frag_entry_pos, vec3(0.001), dim - vec3(0.001));
@@ -66,7 +86,9 @@ void main() {
         last_sign = (dist_lo.z < dist_hi.z) ? 1 : -1;
     }
 
-    int max_steps = int(dim.x + dim.y + dim.z) * 2;
+    // With MIP3 jump-skip, rays traverse empty space in O(1) per block.
+    // 128 steps is sufficient for 64³ grids (diagonal ≈ 110 voxels).
+    int max_steps = 128;
     int step_count = 0;
     // Visualization modes via palette_color.a:
     // < 1.5 = normal rendering
@@ -183,79 +205,98 @@ void main() {
             }
         }
 
-        // MIP acceleration: if we just stepped into an aligned empty block,
-        // keep stepping through it without checking voxels (they're all empty).
-        // This is safe because we do proper per-voxel DDA steps.
-        // MIP2: 4x4x4 block
+        // MIP acceleration: skip known-empty blocks at multiple scales.
+        // When a block is empty, jump the DDA to the block boundary in O(1)
+        // instead of stepping voxel-by-voxel.
+
+        // MIP3: 8x8x8 block — jump skip
         {
-            ivec3 block = pos >> 2;
-            if ((pos.x & 3) == (step_dir.x > 0 ? 0 : 3) &&
-                (pos.y & 3) == (step_dir.y > 0 ? 0 : 3) &&
-                (pos.z & 3) == (step_dir.z > 0 ? 0 : 3)) {
-                // Just entered a new 4x4x4 block — but alignment check is tricky.
-            }
-            // Simpler: check if current pos is inside a known-empty MIP2 block
+            ivec3 block = pos >> 3;
             if (block.x >= 0 && block.y >= 0 && block.z >= 0 &&
-                block.x < int(pc.mip2_dim.x) && block.y < int(pc.mip2_dim.y) && block.z < int(pc.mip2_dim.z)) {
-                if (texelFetch(mip2_grid, block, 0).r == 0u) {
-                    // Fast-step through the empty block using normal DDA
-                    // until we exit this MIP2 cell
-                    ivec3 block_start = block;
-                    for (int ms = 0; ms < 12; ms++) { // max 4+4+4 steps to cross a 4x4x4 block
-                        if (t_max.x < t_max.y) {
-                            if (t_max.x < t_max.z) {
-                                last_axis = 0; last_sign = step_dir.x;
-                                pos.x += step_dir.x; t_max.x += t_delta.x;
-                            } else {
-                                last_axis = 2; last_sign = step_dir.z;
-                                pos.z += step_dir.z; t_max.z += t_delta.z;
-                            }
-                        } else {
-                            if (t_max.y < t_max.z) {
-                                last_axis = 1; last_sign = step_dir.y;
-                                pos.y += step_dir.y; t_max.y += t_delta.y;
-                            } else {
-                                last_axis = 2; last_sign = step_dir.z;
-                                pos.z += step_dir.z; t_max.z += t_delta.z;
-                            }
-                        }
-                        step_count++;
-                        // Check if we left this MIP2 cell
-                        if ((pos >> 2) != block_start) break;
+                block.x < int(pc.mip3_dim.x) && block.y < int(pc.mip3_dim.y) && block.z < int(pc.mip3_dim.z)) {
+                if (texelFetch(mip3_grid, block, 0).r == 0u) {
+                    // Compute how many voxels to the exit boundary of this 8-block
+                    ivec3 block_min = block * 8;
+                    ivec3 block_max = block_min + 8;
+                    // For each axis, distance to exit boundary
+                    int dx = (step_dir.x > 0) ? (block_max.x - pos.x) : (pos.x - block_min.x + 1);
+                    int dy = (step_dir.y > 0) ? (block_max.y - pos.y) : (pos.y - block_min.y + 1);
+                    int dz = (step_dir.z > 0) ? (block_max.z - pos.z) : (pos.z - block_min.z + 1);
+                    // Advance DDA state by jumping across the block
+                    float tx = t_max.x + t_delta.x * float(dx - 1);
+                    float ty = t_max.y + t_delta.y * float(dy - 1);
+                    float tz = t_max.z + t_delta.z * float(dz - 1);
+                    if (tx < ty && tx < tz) {
+                        last_axis = 0; last_sign = step_dir.x;
+                        pos.x += step_dir.x * dx; t_max.x += t_delta.x * float(dx);
+                    } else if (ty < tz) {
+                        last_axis = 1; last_sign = step_dir.y;
+                        pos.y += step_dir.y * dy; t_max.y += t_delta.y * float(dy);
+                    } else {
+                        last_axis = 2; last_sign = step_dir.z;
+                        pos.z += step_dir.z * dz; t_max.z += t_delta.z * float(dz);
                     }
-                    continue; // re-check bounds + voxel at new position
+                    step_count++;
+                    continue;
                 }
             }
         }
 
-        // MIP1: 2x2x2 block (same logic, smaller block)
+        // MIP2: 4x4x4 block — jump skip
+        {
+            ivec3 block = pos >> 2;
+            if (block.x >= 0 && block.y >= 0 && block.z >= 0 &&
+                block.x < int(pc.mip2_dim.x) && block.y < int(pc.mip2_dim.y) && block.z < int(pc.mip2_dim.z)) {
+                if (texelFetch(mip2_grid, block, 0).r == 0u) {
+                    ivec3 block_min = block * 4;
+                    ivec3 block_max = block_min + 4;
+                    int dx = (step_dir.x > 0) ? (block_max.x - pos.x) : (pos.x - block_min.x + 1);
+                    int dy = (step_dir.y > 0) ? (block_max.y - pos.y) : (pos.y - block_min.y + 1);
+                    int dz = (step_dir.z > 0) ? (block_max.z - pos.z) : (pos.z - block_min.z + 1);
+                    float tx = t_max.x + t_delta.x * float(dx - 1);
+                    float ty = t_max.y + t_delta.y * float(dy - 1);
+                    float tz = t_max.z + t_delta.z * float(dz - 1);
+                    if (tx < ty && tx < tz) {
+                        last_axis = 0; last_sign = step_dir.x;
+                        pos.x += step_dir.x * dx; t_max.x += t_delta.x * float(dx);
+                    } else if (ty < tz) {
+                        last_axis = 1; last_sign = step_dir.y;
+                        pos.y += step_dir.y * dy; t_max.y += t_delta.y * float(dy);
+                    } else {
+                        last_axis = 2; last_sign = step_dir.z;
+                        pos.z += step_dir.z * dz; t_max.z += t_delta.z * float(dz);
+                    }
+                    step_count++;
+                    continue;
+                }
+            }
+        }
+
+        // MIP1: 2x2x2 block — jump skip
         {
             ivec3 block = pos >> 1;
             if (block.x >= 0 && block.y >= 0 && block.z >= 0 &&
                 block.x < int(pc.mip1_dim.x) && block.y < int(pc.mip1_dim.y) && block.z < int(pc.mip1_dim.z)) {
                 if (texelFetch(mip1_grid, block, 0).r == 0u) {
-                    ivec3 block_start = block;
-                    for (int ms = 0; ms < 6; ms++) {
-                        if (t_max.x < t_max.y) {
-                            if (t_max.x < t_max.z) {
-                                last_axis = 0; last_sign = step_dir.x;
-                                pos.x += step_dir.x; t_max.x += t_delta.x;
-                            } else {
-                                last_axis = 2; last_sign = step_dir.z;
-                                pos.z += step_dir.z; t_max.z += t_delta.z;
-                            }
-                        } else {
-                            if (t_max.y < t_max.z) {
-                                last_axis = 1; last_sign = step_dir.y;
-                                pos.y += step_dir.y; t_max.y += t_delta.y;
-                            } else {
-                                last_axis = 2; last_sign = step_dir.z;
-                                pos.z += step_dir.z; t_max.z += t_delta.z;
-                            }
-                        }
-                        step_count++;
-                        if ((pos >> 1) != block_start) break;
+                    ivec3 block_min = block * 2;
+                    ivec3 block_max = block_min + 2;
+                    int dx = (step_dir.x > 0) ? (block_max.x - pos.x) : (pos.x - block_min.x + 1);
+                    int dy = (step_dir.y > 0) ? (block_max.y - pos.y) : (pos.y - block_min.y + 1);
+                    int dz = (step_dir.z > 0) ? (block_max.z - pos.z) : (pos.z - block_min.z + 1);
+                    float tx = t_max.x + t_delta.x * float(dx - 1);
+                    float ty = t_max.y + t_delta.y * float(dy - 1);
+                    float tz = t_max.z + t_delta.z * float(dz - 1);
+                    if (tx < ty && tx < tz) {
+                        last_axis = 0; last_sign = step_dir.x;
+                        pos.x += step_dir.x * dx; t_max.x += t_delta.x * float(dx);
+                    } else if (ty < tz) {
+                        last_axis = 1; last_sign = step_dir.y;
+                        pos.y += step_dir.y * dy; t_max.y += t_delta.y * float(dy);
+                    } else {
+                        last_axis = 2; last_sign = step_dir.z;
+                        pos.z += step_dir.z * dz; t_max.z += t_delta.z * float(dz);
                     }
+                    step_count++;
                 }
             }
         }
