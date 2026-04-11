@@ -241,13 +241,26 @@ impl VulkanContext {
             unique_families.push(transfer_idx);
         }
 
-        let queue_priorities = [1.0f32];
+        // Give graphics max priority (1.0) and compute/transfer low priority
+        // (0.1). Graphics is latency-critical (each frame's render_fence must
+        // signal before the next frame can proceed); terrain compute is a
+        // background job whose chunks can arrive a few frames late. When the
+        // GPU has both queues competing for SM time, the scheduler prefers
+        // the higher-priority queue — this reduces render wait time when
+        // compute is saturated.
+        let high_priority = [1.0f32];
+        let low_priority = [0.1f32];
         let queue_cis: Vec<vk::DeviceQueueCreateInfo> = unique_families
             .iter()
             .map(|&family| {
+                let priorities = if family == graphics_idx {
+                    &high_priority[..]
+                } else {
+                    &low_priority[..]
+                };
                 vk::DeviceQueueCreateInfo::default()
                     .queue_family_index(family)
-                    .queue_priorities(&queue_priorities)
+                    .queue_priorities(priorities)
             })
             .collect();
 

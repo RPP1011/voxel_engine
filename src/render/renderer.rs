@@ -118,7 +118,7 @@ impl VoxelRenderer {
             .descriptor(2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, vk::ShaderStageFlags::FRAGMENT)
             .descriptor(3, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, vk::ShaderStageFlags::FRAGMENT)
             .descriptor(4, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, vk::ShaderStageFlags::FRAGMENT)
-            .color_attachment_count(5)
+            .color_attachment_count(3)
             .cull_mode(vk::CullModeFlags::NONE) // no HW culling; back faces discarded in frag shader
             .build()?;
 

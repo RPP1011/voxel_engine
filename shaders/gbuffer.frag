@@ -15,8 +15,8 @@ layout(location = 1) flat in vec3 frag_camera_pos;
 layout(location = 0) out vec4 out_albedo;     // RT0: RGBA8
 layout(location = 1) out vec4 out_normal;      // RT1: RGB16F (xyz = world normal)
 layout(location = 2) out vec4 out_material;    // RT2: RGBA8 (roughness, metallic, emissive, material_type)
-layout(location = 3) out vec4 out_velocity;    // RT3: RGBA16F (rg = velocity, b = water mask)
-layout(location = 4) out float out_depth;      // RT4: R32F (linear depth)
+// Former RT3 (velocity) and RT4 (linear depth) removed — neither was read
+// by any downstream pass, and the ROP writes cost real per-fragment time.
 
 layout(set = 0, binding = 0) uniform usampler3D voxel_grid;
 layout(set = 0, binding = 1) uniform usampler3D mip1_grid;
@@ -111,8 +111,6 @@ void main() {
                 out_albedo = vec4(0.25, 0.25, 0.25, 1.0);
                 out_normal = vec4(sun_n * 0.5 + 0.5, 0.0);
                 out_material = vec4(0.0);
-                out_velocity = vec4(0.0);
-                out_depth = 1e6;
                 gl_FragDepth = 0.9999;
                 return;
             }
@@ -175,8 +173,6 @@ void main() {
             out_albedo = vec4(final_color, 1.0);
             out_normal = vec4(normal * 0.5 + 0.5, 0.0); // encode [-1,1] → [0,1]
             out_material = vec4(pc.palette_color.a, 0.0, 0.0, float(voxel) / 255.0);
-            out_velocity = vec4(0.0); // static for now
-            out_depth = length(hit_pos - frag_camera_pos);
 
             // Write hardware depth (MVP expects unit-space [0,1], hit_pos is grid-space [0,dim])
             vec4 clip = pc.mvp * vec4(hit_pos / pc.grid_dim.xyz, 1.0);

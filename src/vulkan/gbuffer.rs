@@ -4,14 +4,15 @@ use ash::vk;
 use super::graphics_pipeline::GraphicsPipeline;
 use super::instance::VulkanContext;
 
-/// G-buffer with 5 color attachments + depth.
+/// G-buffer with 3 color attachments + depth.
+/// (Previously 5 — velocity and linear-depth RTs were written per frame but
+/// never sampled by any downstream pass, so they were pure ROP overhead.)
 pub struct GBuffer {
     pub width: u32,
     pub height: u32,
     pub render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
-    // RT0: Albedo RGBA8, RT1: Normal RGBA16F, RT2: Material RGBA8,
-    // RT3: Velocity RGBA16F, RT4: Depth R32F
+    // RT0: Albedo RGBA8, RT1: Normal RGBA16F, RT2: Material RGBA8
     rt_images: Vec<vk::Image>,
     rt_memories: Vec<vk::DeviceMemory>,
     rt_views: Vec<vk::ImageView>,
@@ -30,12 +31,10 @@ struct RtSpec {
     format: vk::Format,
 }
 
-const RT_SPECS: [RtSpec; 5] = [
-    RtSpec { format: vk::Format::R8G8B8A8_UNORM },   // albedo
-    RtSpec { format: vk::Format::R16G16B16A16_SFLOAT }, // normal
-    RtSpec { format: vk::Format::R8G8B8A8_UNORM },   // material
-    RtSpec { format: vk::Format::R16G16B16A16_SFLOAT }, // velocity
-    RtSpec { format: vk::Format::R32_SFLOAT },         // linear depth
+const RT_SPECS: [RtSpec; 3] = [
+    RtSpec { format: vk::Format::R8G8B8A8_UNORM },     // albedo
+    RtSpec { format: vk::Format::R16G16B16A16_SFLOAT },// normal
+    RtSpec { format: vk::Format::R8G8B8A8_UNORM },     // material
 ];
 
 impl GBuffer {
@@ -56,7 +55,7 @@ impl GBuffer {
                     .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
             );
         }
-        // Depth attachment (index 5)
+        // Depth attachment (index 3)
         attachments.push(
             vk::AttachmentDescription::default()
                 .format(vk::Format::D32_SFLOAT)
@@ -67,14 +66,14 @@ impl GBuffer {
                 .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
         );
 
-        let color_refs: Vec<vk::AttachmentReference> = (0..5)
+        let color_refs: Vec<vk::AttachmentReference> = (0..3)
             .map(|i| vk::AttachmentReference {
                 attachment: i,
                 layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             })
             .collect();
         let depth_ref = vk::AttachmentReference {
-            attachment: 5,
+            attachment: 3,
             layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         };
 
@@ -216,11 +215,9 @@ impl GBuffer {
         objects: &[(&[u8], vk::DescriptorSet)],
     ) {
         let clear_values = [
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
+            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // albedo
+            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // normal
+            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // material
             vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
         ];
 
@@ -284,11 +281,9 @@ impl GBuffer {
         let cmd = unsafe { device.allocate_command_buffers(&alloc_ci) }?[0];
 
         let clear_values = [
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
+            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // albedo
+            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // normal
+            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // material
             vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
         ];
 
@@ -365,11 +360,9 @@ impl GBuffer {
         let cmd = unsafe { device.allocate_command_buffers(&alloc_ci) }?[0];
 
         let clear_values = [
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } },
+            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // albedo
+            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // normal
+            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // material
             vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
         ];
 
