@@ -225,6 +225,47 @@ impl GBuffer {
     /// Expose the command pool for external command buffer allocation.
     pub fn command_pool(&self) -> vk::CommandPool { self.command_pool }
 
+    /// Record G-buffer batch rendering commands into an existing command
+    /// buffer. Takes two parallel slices (push constants + descriptor sets)
+    /// so callers don't have to collect them into a Vec of tuples first.
+    /// Does NOT begin/end the command buffer or submit it.
+    pub fn record_batch_slices<const PC: usize>(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        pipeline: &GraphicsPipeline,
+        push_constants: &[[u8; PC]],
+        desc_sets: &[vk::DescriptorSet],
+    ) {
+        debug_assert_eq!(push_constants.len(), desc_sets.len());
+        let clear_values = [
+            vk::ClearValue { color: vk::ClearColorValue { float32: [0.1, 0.1, 0.15, 1.0] } }, // sky clear color
+            vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
+        ];
+
+        unsafe {
+            device.cmd_begin_render_pass(cmd, &vk::RenderPassBeginInfo::default()
+                .render_pass(self.render_pass).framebuffer(self.framebuffer)
+                .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width: self.width, height: self.height } })
+                .clear_values(&clear_values), vk::SubpassContents::INLINE);
+
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
+            device.cmd_set_viewport(cmd, 0, &[vk::Viewport { x: 0.0, y: 0.0, width: self.width as f32, height: self.height as f32, min_depth: 0.0, max_depth: 1.0 }]);
+            device.cmd_set_scissor(cmd, 0, &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width: self.width, height: self.height } }]);
+
+            device.cmd_bind_vertex_buffers(cmd, 0, &[self.unit_vb], &[0]);
+            device.cmd_bind_index_buffer(cmd, self.unit_ib, 0, vk::IndexType::UINT32);
+
+            for i in 0..push_constants.len() {
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.layout, 0, &[desc_sets[i]], &[]);
+                device.cmd_push_constants(cmd, pipeline.layout, vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT, 0, &push_constants[i]);
+                device.cmd_draw_indexed(cmd, 36, 1, 0, 0, 0);
+            }
+
+            device.cmd_end_render_pass(cmd);
+        }
+    }
+
     /// Record G-buffer batch rendering commands into an existing command buffer.
     /// Does NOT begin/end the command buffer or submit it.
     pub fn record_batch(

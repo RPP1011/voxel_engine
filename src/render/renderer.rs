@@ -840,12 +840,6 @@ impl VoxelRenderer {
             self.batch_push_buf.push(push_data);
         }
 
-        let batch_objects: Vec<(&[u8], vk::DescriptorSet)> = self.batch_push_buf
-            .iter()
-            .zip(self.obj_gbuf_desc_sets.iter())
-            .map(|(p, d)| (p.as_ref(), *d))
-            .collect();
-
         let device = ctx.device();
         let gq = ctx.graphics_queue().unwrap();
 
@@ -865,7 +859,17 @@ impl VoxelRenderer {
         // the dead shadow pass (nothing sampled it) and a redundant
         // record_transition_for_sampling call (the render pass's
         // final_layout + subpass dependency handle the transition).
-        self.gbuffer.record_batch(device, cmd, &self.gbuffer_pipeline, &batch_objects);
+        //
+        // Pass the push buffer and descriptor set vec as two parallel
+        // slices — avoids the per-frame Vec<(&[u8], DescriptorSet)>
+        // allocation the old `record_batch` path required.
+        self.gbuffer.record_batch_slices(
+            device,
+            cmd,
+            &self.gbuffer_pipeline,
+            &self.batch_push_buf,
+            &self.obj_gbuf_desc_sets,
+        );
         let _ = eye; // unused now that lighting is in-shader
         let _ = camera;
 
