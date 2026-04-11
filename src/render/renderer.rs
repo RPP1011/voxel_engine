@@ -971,6 +971,39 @@ impl VoxelRenderer {
         self.render_done_semaphores[(self.frame_index + 1) % 2]
     }
 
+    /// Returns true if the camera and chunk-pool state are identical to the
+    /// last call to `render_frame_pool`. When true, the renderer's output
+    /// image AND the most recently presented swapchain image already hold
+    /// the correct pixels, so the caller can skip the entire
+    /// wait→render→present chain this frame — no fence sync, no cmd
+    /// buffer submit, no blit, no vkQueuePresentKHR. The display keeps
+    /// scanning out the last presented image (IMMEDIATE mode does not
+    /// require continuous presentation).
+    ///
+    /// Must stay bit-identical to the `cache_hit` check inside
+    /// `render_frame_pool`, otherwise a true return here would silently
+    /// produce stale frames.
+    pub fn cache_matches(
+        &self,
+        camera: &impl RenderCamera,
+        views: &[(LoadedChunkView, [f32; 4], [f32; 3], [f32; 3])],
+    ) -> bool {
+        let eye = camera.eye_position();
+        let center = camera.center();
+        let mut pool_hash: u64 = 0xcbf29ce484222325 ^ (views.len() as u64);
+        for (v, _, _, _) in views {
+            pool_hash ^= (v.main_view.as_raw() as u64).wrapping_mul(0x100000001b3);
+        }
+        let cam_key = [
+            eye[0], eye[1], eye[2],
+            center.x, center.y, center.z,
+            0.0, 0.0, 0.0, 0.0,
+        ];
+        self.last_push_cam_key.map(|k| k == cam_key).unwrap_or(false)
+            && self.last_push_pool_hash == pool_hash
+            && self.batch_push_buf.len() == views.len()
+    }
+
     /// Block the CPU until the render-slot that `render_frame_pool` will
     /// reuse next has finished its previous submission. With two-slot
     /// pipelining this is the fence from TWO frames ago, not one — in
