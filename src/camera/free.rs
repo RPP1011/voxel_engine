@@ -37,6 +37,7 @@ impl FreeCamera {
 
     // Renderer-compatible accessors (match OrbitCamera API)
 
+    #[inline]
     pub fn eye_position(&self) -> [f32; 3] {
         self.camera.position.into()
     }
@@ -49,6 +50,7 @@ impl FreeCamera {
         self.camera.projection_matrix(aspect).to_cols_array()
     }
 
+    #[inline]
     pub fn center(&self) -> Vec3 {
         self.camera.target
     }

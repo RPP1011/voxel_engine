@@ -1500,6 +1500,7 @@ impl TerrainComputePipeline {
     /// Returns `(free, in_flight, loaded)` slot counts for the pool.
     /// O(1): reads cached counters maintained incrementally on state
     /// transitions, no slot scan.
+    #[inline]
     pub fn pool_stats(&self) -> (usize, usize, usize) {
         (self.free_count, self.in_flight_count, self.loaded_count)
     }
@@ -1514,6 +1515,7 @@ impl TerrainComputePipeline {
     /// would change (slot enters/leaves the `Loaded` state). Callers that
     /// cache iteration results can key on this to detect whether the
     /// cache is still valid.
+    #[inline]
     pub fn pool_generation(&self) -> u64 {
         self.pool_generation
     }
@@ -1561,6 +1563,7 @@ impl TerrainComputePipeline {
     /// it should STOP calling this — future frames' full-cull path will
     /// rewrite individual slots' `last_touched_frame`, letting slots
     /// that genuinely fell out of the visible set age out normally.
+    #[inline]
     pub fn bulk_touch_all_loaded(&mut self, current_frame: u64) {
         // Monotonic: never move backwards, guards against callers that
         // cycle through frame counters or call out of order.
