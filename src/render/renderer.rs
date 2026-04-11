@@ -955,6 +955,19 @@ impl VoxelRenderer {
         self.render_done_semaphore
     }
 
+    /// Block the CPU until the in-flight render submit (if any) has finished.
+    /// Normally this wait sits at the top of `render_frame_pool` where its cost
+    /// is lumped into the raycast bucket; callers that want to measure the
+    /// wait separately can invoke it manually, then `render_frame_pool` will
+    /// skip the internal wait (the fence is already signaled).
+    pub fn wait_for_previous_frame(&self, ctx: &VulkanContext) -> Result<()> {
+        let device = ctx.device();
+        unsafe {
+            device.wait_for_fences(&[self.render_fence], true, u64::MAX)?;
+        }
+        Ok(())
+    }
+
     pub fn destroy(self, ctx: &VulkanContext) {
         let device = ctx.device();
         unsafe {
