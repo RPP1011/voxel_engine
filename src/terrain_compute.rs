@@ -146,6 +146,10 @@ struct ComputeSlot {
 /// sets directly from the pool slots without any CPU round-trip.
 #[derive(Clone, Copy, Debug)]
 pub struct LoadedChunkView {
+    /// Index of the pool slot owning this chunk. Stable for the lifetime
+    /// of the chunk in the pool, lets callers bypass the linear-scan
+    /// lookup in `mark_touched` via `mark_touched_slot`.
+    pub slot_idx: u32,
     pub chunk_pos: ChunkKey,
     pub main_view: vk::ImageView,
     pub mip1_view: vk::ImageView,
@@ -1443,8 +1447,9 @@ impl TerrainComputePipeline {
     /// The pool render entry point consumes this to build per-frame
     /// descriptor sets without any CPU round-trip.
     pub fn loaded_chunk_views(&self) -> impl Iterator<Item = LoadedChunkView> + '_ {
-        self.slots.iter().filter_map(|s| match s.state {
+        self.slots.iter().enumerate().filter_map(|(idx, s)| match s.state {
             SlotState::Loaded(pos) => Some(LoadedChunkView {
+                slot_idx: idx as u32,
                 chunk_pos: pos,
                 main_view: s.output_image_view,
                 mip1_view: s.mip1_view,
@@ -1457,6 +1462,17 @@ impl TerrainComputePipeline {
             }),
             _ => None,
         })
+    }
+
+    /// O(1) mark-touched by slot index. Preferred over `mark_touched` when
+    /// the caller already knows the slot index (e.g. from a recent
+    /// `loaded_chunk_views` iteration).
+    pub fn mark_touched_slot(&mut self, slot_idx: u32, current_frame: u64) {
+        if let Some(s) = self.slots.get_mut(slot_idx as usize) {
+            if matches!(s.state, SlotState::Loaded(_)) {
+                s.last_touched_frame = current_frame;
+            }
+        }
     }
 
     /// Return the shared palette image view. Returns `vk::ImageView::null()`
