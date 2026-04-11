@@ -559,6 +559,20 @@ impl SwapchainContext {
         src_width: u32,
         src_height: u32,
     ) -> Result<()> {
+        self.present_blit_with_wait(ctx, src_image, src_width, src_height, vk::Semaphore::null())
+    }
+
+    /// Like `present_blit`, but also GPU-side waits on `extra_wait` (e.g. the
+    /// renderer's `render_done_semaphore`) before performing the blit. Pass
+    /// `vk::Semaphore::null()` to skip.
+    pub fn present_blit_with_wait(
+        &mut self,
+        ctx: &VulkanContext,
+        src_image: vk::Image,
+        src_width: u32,
+        src_height: u32,
+        extra_wait: vk::Semaphore,
+    ) -> Result<()> {
         let device = ctx.device();
         let frame = self.current_frame;
 
@@ -659,14 +673,19 @@ impl SwapchainContext {
             device.end_command_buffer(cmd)?;
         }
 
-        // Submit
-        let wait_semaphores = [self.image_available[frame]];
+        // Submit — wait for both the swapchain image to be acquired AND
+        // (optionally) the renderer's output to have finished writing.
+        let wait_semaphores_full: [vk::Semaphore; 2] = [self.image_available[frame], extra_wait];
+        let wait_stages_full: [vk::PipelineStageFlags; 2] =
+            [vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER];
+        let wait_count = if extra_wait == vk::Semaphore::null() { 1 } else { 2 };
+        let wait_semaphores = &wait_semaphores_full[..wait_count];
+        let wait_stages = &wait_stages_full[..wait_count];
         let signal_semaphores = [self.render_finished[frame]];
-        let wait_stages = [vk::PipelineStageFlags::TRANSFER];
         let cmd_bufs = [cmd];
         let submit_info = vk::SubmitInfo::default()
-            .wait_semaphores(&wait_semaphores)
-            .wait_dst_stage_mask(&wait_stages)
+            .wait_semaphores(wait_semaphores)
+            .wait_dst_stage_mask(wait_stages)
             .command_buffers(&cmd_bufs)
             .signal_semaphores(&signal_semaphores);
 

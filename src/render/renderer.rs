@@ -66,6 +66,13 @@ pub struct VoxelRenderer {
     // Pre-allocated Vulkan objects to avoid per-frame alloc/free
     render_cmd: [vk::CommandBuffer; 2],
     render_fence: vk::Fence,
+    /// Binary semaphore signaled by each `render_frame_pool` submit and
+    /// consumed by the subsequent `present_blit` submit. Lets the CPU return
+    /// from `render_frame_pool` without waiting for the GPU render to finish,
+    /// while still ensuring `present_blit`'s blit reads a finished frame.
+    /// Safe as a single binary semaphore because the start-of-frame
+    /// `render_fence` wait caps us at one render in flight at a time.
+    render_done_semaphore: vk::Semaphore,
     frame_index: usize,
     // Reusable per-frame Vec buffers (cleared each frame, capacity preserved)
     batch_push_buf: Vec<[u8; 176]>,
@@ -220,6 +227,14 @@ impl VoxelRenderer {
             )
         }?;
 
+        // Binary semaphore for render→present handoff. Unsignaled at creation;
+        // the first frame must NOT have anyone waiting on it before it's first
+        // signaled. The call graph guarantees render_frame_pool runs before
+        // present_blit every frame, so this holds.
+        let render_done_semaphore = unsafe {
+            device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        }?;
+
         // Write light descriptor set once — GBuffer RT views never change
         let light_img_infos = [
             vk::DescriptorImageInfo::default()
@@ -269,6 +284,7 @@ impl VoxelRenderer {
             voxel_sampler,
             render_cmd,
             render_fence,
+            render_done_semaphore,
             frame_index: 0,
             batch_push_buf: Vec::new(),
         })
@@ -915,13 +931,28 @@ impl VoxelRenderer {
         unsafe {
             device.end_command_buffer(cmd)?;
             let cmds = [cmd];
-            let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+            let signals = [self.render_done_semaphore];
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(&cmds)
+                .signal_semaphores(&signals);
             device.queue_submit(gq.queue, &[submit], self.render_fence)?;
-            device.wait_for_fences(&[self.render_fence], true, u64::MAX)?;
+            // No end wait_for_fences: the CPU returns immediately after
+            // queuing the render, letting the next frame's CPU work
+            // (drain/gen/sim) overlap with GPU render. The start-of-frame
+            // wait on render_fence throttles us to one render-in-flight,
+            // and present_blit waits on render_done_semaphore before its
+            // blit reads the light target.
         }
         self.frame_index += 1;
 
         Ok(())
+    }
+
+    /// Semaphore signaled by each `render_frame_pool` submit. Callers pass
+    /// this to the swapchain's present/blit step so the blit GPU-side waits
+    /// for render to finish before reading the light target.
+    pub fn render_done_semaphore(&self) -> vk::Semaphore {
+        self.render_done_semaphore
     }
 
     pub fn destroy(self, ctx: &VulkanContext) {
@@ -930,6 +961,7 @@ impl VoxelRenderer {
             // Wait for any in-flight work before destroying
             let _ = device.wait_for_fences(&[self.render_fence], true, u64::MAX);
             device.destroy_fence(self.render_fence, None);
+            device.destroy_semaphore(self.render_done_semaphore, None);
             device.free_command_buffers(self.gbuffer.command_pool(), &self.render_cmd);
             if let Some(pool) = self.obj_desc_pool {
                 device.destroy_descriptor_pool(pool, None);
