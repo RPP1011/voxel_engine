@@ -607,9 +607,15 @@ uvec2 seed_plus_salt(uint seed, uvec2 salt) {
 // Maximum footprint radii (must conservatively bound the largest shape).
 // Hierarchical procedural trees: a large jungle tree (trunk 120, primary ratio
 // 0.55) reaches primary_horizontal (~56) + secondary (~44) + leaf_radius (~23)
-// ≈ 123 voxels horizontally. Use 135 to bound with slack.
+// ≈ 123 voxels horizontally. We previously tried rmax=75 for perf (commit
+// 43f7cd2 reduced from 135) but that left 75-123 voxels of every large
+// tree's canopy unreachable from neighboring chunks: voxels whose origin
+// column was >75 voxels away in a neighbor chunk silently dropped the
+// tree, so trees popped in and out as the camera crossed chunk
+// boundaries (different chunks rendered different subsets of the same
+// world tree). 130 covers the full reach with ~5% slack.
 // Vertical: fork_height + primary cos(elev) + secondary + leaf ≈ 210 above base.
-const int FEATURE_MAX_RADIUS_SQ = 5625; // 75² — matches rmax below
+const int FEATURE_MAX_RADIUS_SQ = 16900; // 130² — matches rmax below
 const int FEATURE_MAX_Z_ABOVE   = 220;  // head-room above surface
 const int FEATURE_MAX_Z_BELOW   = 45;   // secondary branches may dip below base
 
@@ -1013,13 +1019,20 @@ uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
     // into this chunk.
     int vlx = vx - base_x;
     int vly = vy - base_y;
-    // Max procedural tree horizontal reach. The old 135 produced
-    // (2*135+1)² ≈ 73K candidate origin columns per voxel in the halo
-    // scan. Realistic max tree reach with the hierarchical grammar:
-    // primary branches 20-40 voxels + secondary 10-20 + leaves 3-6
-    // → ~60-70 voxel radius. 75 gives a small safety margin and cuts
-    // candidate count to ~17K (77% reduction in per-voxel scan work).
-    int rmax = 75;
+    // Max procedural tree horizontal reach. We previously tried 75 here
+    // (commit 43f7cd2) on the assumption that realistic tree reach was
+    // ~60-70 voxels. That was wrong for large jungle trees, which can
+    // reach ~123 voxels (primary 56 + secondary 44 + leaf 23). With
+    // rmax=75, voxels in chunk B whose origin column was >75 voxels
+    // away in chunk A silently dropped the tree's canopy, and which
+    // voxels got dropped depended on the chunk being rendered — so
+    // trees popped in and out as the camera crossed chunk boundaries.
+    // 130 covers the documented max reach with ~5% slack. The (2*130+1)²
+    // ≈ 68k candidate count is ~3x the rmax=75 cost but still fully
+    // pruned by the cheap density pre-checks below.
+    // MUST stay in lockstep with FEATURE_MAX_RADIUS_SQ above and the
+    // CPU-side HALO constant in features.rs::place_surface_features.
+    int rmax = 130;
     int olx_min = vlx - rmax;
     int olx_max = vlx + rmax;
     int oly_min = vly - rmax;
