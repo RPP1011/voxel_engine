@@ -271,6 +271,15 @@ pub struct TerrainComputePipeline {
     /// and the camera hasn't moved, last frame's cull result is still
     /// correct.
     pool_generation: u64,
+    /// Cached slot-state counts, maintained incrementally on every state
+    /// transition so `pool_stats()` is O(1) and `try_take_completed*`
+    /// can early-exit without sweeping the slots Vec when nothing is
+    /// in flight. On a 256-slot pool at 100k+ FPS, the per-frame linear
+    /// scans were touching 256 cache lines × 3 call sites = ~800 cache
+    /// lines per frame, by far the biggest remaining render-loop cost.
+    free_count: usize,
+    in_flight_count: usize,
+    loaded_count: usize,
     // Region plan + rivers (shared across all slots; re-bound to every slot's
     // descriptor set whenever they are uploaded).
     region_cells_buffer: Option<AllocatedBuffer>,
@@ -758,6 +767,9 @@ impl TerrainComputePipeline {
             slots,
             next_request_id: 1,
             pool_generation: 0,
+            free_count: NUM_SLOTS,
+            in_flight_count: 0,
+            loaded_count: 0,
             region_cells_buffer: None,
             region_header_buffer: None,
             placeholder_cells_buffer,
@@ -870,6 +882,9 @@ impl TerrainComputePipeline {
         // Every previously-Loaded slot just dropped out of
         // `loaded_chunk_views()` at once.
         self.pool_generation += 1;
+        self.free_count = NUM_SLOTS;
+        self.in_flight_count = 0;
+        self.loaded_count = 0;
         Ok(())
     }
 
@@ -1341,6 +1356,18 @@ impl TerrainComputePipeline {
             device.queue_submit(cq.queue, &[submit], slot.fence)?;
         }
 
+        // Update counters before overwriting state: decrement whichever
+        // old-state counter the slot was contributing to.
+        match slot.state {
+            SlotState::Free => self.free_count -= 1,
+            SlotState::Loaded(_) => self.loaded_count -= 1,
+            SlotState::InFlight(_) => {
+                debug_assert!(false, "submit_chunk chose an InFlight slot");
+                self.in_flight_count -= 1;
+            }
+        }
+        self.in_flight_count += 1;
+
         slot.state = SlotState::InFlight(request_id);
         slot.first_use = false;
         slot.chunk_pos = chunk_pos;
@@ -1380,6 +1407,14 @@ impl TerrainComputePipeline {
         ctx: &VulkanContext,
         current_frame: u64,
     ) -> Result<Vec<(u64, ChunkKey)>> {
+        // Hot-path fast exit: if nothing is in flight, skip the 256-slot
+        // scan entirely. This is the common case on a stable camera and
+        // was the single biggest render-loop cost at 150k+ FPS before
+        // the counter was added.
+        if self.in_flight_count == 0 {
+            return Ok(Vec::new());
+        }
+
         let device = ctx.device();
         let mut completed = Vec::new();
         for slot in self.slots.iter_mut() {
@@ -1395,6 +1430,8 @@ impl TerrainComputePipeline {
                     completed.push((request_id, slot.chunk_pos));
                     // A new entry just appeared in `loaded_chunk_views()`.
                     self.pool_generation += 1;
+                    self.in_flight_count -= 1;
+                    self.loaded_count += 1;
                 }
                 Ok(false) => {
                     // Still running, leave in-flight.
@@ -1444,18 +1481,10 @@ impl TerrainComputePipeline {
     }
 
     /// Returns `(free, in_flight, loaded)` slot counts for the pool.
+    /// O(1): reads cached counters maintained incrementally on state
+    /// transitions, no slot scan.
     pub fn pool_stats(&self) -> (usize, usize, usize) {
-        let mut free = 0;
-        let mut in_flight = 0;
-        let mut loaded = 0;
-        for s in &self.slots {
-            match s.state {
-                SlotState::Free => free += 1,
-                SlotState::InFlight(_) => in_flight += 1,
-                SlotState::Loaded(_) => loaded += 1,
-            }
-        }
-        (free, in_flight, loaded)
+        (self.free_count, self.in_flight_count, self.loaded_count)
     }
 
     /// Iterate over all Loaded slots, yielding a full [`LoadedChunkView`] per
