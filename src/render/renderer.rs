@@ -674,16 +674,20 @@ impl VoxelRenderer {
         views: &[(LoadedChunkView, [f32; 4], [f32; 3], [f32; 3])],
         palette_view: vk::ImageView,
     ) -> Result<()> {
-        // Hash: palette + all main/mip image views.
+        // Hash: palette + all main image views. Order-INDEPENDENT XOR so a
+        // simple camera rotation (which re-sorts visible chunks by distance
+        // but doesn't change the set) doesn't thrash the descriptor pool.
+        // Rebuilding descriptor sets destroys + recreates the pool plus
+        // N * vkAllocateDescriptorSets + N * vkUpdateDescriptorSets, which
+        // gets expensive at 50+ visible chunks.
         let mut obj_hash: u64 = 0xcbf29ce484222325;
-        obj_hash ^= views.len() as u64;
-        obj_hash = obj_hash.wrapping_mul(0x100000001b3);
-        obj_hash ^= palette_view.as_raw() as u64;
-        obj_hash = obj_hash.wrapping_mul(0x100000001b3);
+        obj_hash ^= (views.len() as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        obj_hash ^= (palette_view.as_raw() as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        let mut view_xor: u64 = 0;
         for (v, _, _, _) in views {
-            obj_hash ^= v.main_view.as_raw() as u64;
-            obj_hash = obj_hash.wrapping_mul(0x100000001b3);
+            view_xor ^= (v.main_view.as_raw() as u64).wrapping_mul(0x9e3779b97f4a7c15);
         }
+        obj_hash ^= view_xor;
         if obj_hash == self.cached_obj_hash && self.obj_desc_pool.is_some() {
             return Ok(());
         }
