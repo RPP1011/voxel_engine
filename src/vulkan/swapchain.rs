@@ -21,6 +21,20 @@ pub struct SwapchainContext {
     current_frame: usize,
     max_frames_in_flight: usize,
     pending_overlay_cleanup: Option<(vk::Buffer, vk::DeviceMemory)>,
+    /// Pre-recorded blit command buffers, one per swapchain image. The
+    /// present path records an identical sequence (barrier → blit →
+    /// barrier) every frame, differing only by the destination image —
+    /// so we cache them and skip the per-frame reset/begin/cmd/end dance.
+    /// `None` until `prepare_blit_commands` is called.
+    prerecorded_blit_cmds: Option<Vec<vk::CommandBuffer>>,
+    /// Fence per swapchain image tracking when its prerecorded blit is
+    /// safe to re-submit. Indexed by acquired image_index (not
+    /// current_frame), since multiple current_frames can recycle the
+    /// same image via different acquire orderings.
+    prerecorded_blit_fences: Option<Vec<vk::Fence>>,
+    /// Source image the prerecorded cmds were built for. Re-record if
+    /// this changes.
+    prerecorded_src_image: vk::Image,
 }
 
 impl SwapchainContext {
@@ -198,7 +212,133 @@ impl SwapchainContext {
             current_frame: 0,
             max_frames_in_flight,
             pending_overlay_cleanup: None,
+            prerecorded_blit_cmds: None,
+            prerecorded_blit_fences: None,
+            prerecorded_src_image: vk::Image::null(),
         })
+    }
+
+    /// Pre-record N identical blit command buffers (one per swapchain
+    /// image), eliminating the per-frame
+    /// reset/begin/barrier/blit/barrier/end work inside `present_blit`.
+    /// Call once after creating the renderer (when you know the source
+    /// image handle). Returns early as a no-op if the same src has
+    /// already been prepared; re-records on a different src.
+    pub fn prepare_blit_commands(
+        &mut self,
+        ctx: &VulkanContext,
+        src_image: vk::Image,
+        src_width: u32,
+        src_height: u32,
+    ) -> Result<()> {
+        if self.prerecorded_src_image == src_image && self.prerecorded_blit_cmds.is_some() {
+            return Ok(());
+        }
+        let device = ctx.device();
+        let image_count = self.images.len();
+
+        // Fresh cmd buffers from a dedicated pool: reusing the regular
+        // `command_buffers` pool would fight with the non-prepared path.
+        // Allocate `image_count` new cmd buffers from the existing pool;
+        // it already has RESET_COMMAND_BUFFER so re-prepare works.
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(image_count as u32);
+        let cmds = unsafe { device.allocate_command_buffers(&alloc) }?;
+
+        let color_subresource = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let src_subresource = vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+
+        for i in 0..image_count {
+            let cmd = cmds[i];
+            let dst_image = self.images[i];
+            unsafe {
+                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
+
+                // UNDEFINED -> TRANSFER_DST_OPTIMAL
+                let to_dst = vk::ImageMemoryBarrier::default()
+                    .image(dst_image)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .subresource_range(color_subresource);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[], &[], &[to_dst],
+                );
+
+                let blit_region = vk::ImageBlit {
+                    src_subresource,
+                    src_offsets: [
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D { x: src_width as i32, y: src_height as i32, z: 1 },
+                    ],
+                    dst_subresource: src_subresource,
+                    dst_offsets: [
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D { x: self.extent.width as i32, y: self.extent.height as i32, z: 1 },
+                    ],
+                };
+                device.cmd_blit_image(
+                    cmd,
+                    src_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    dst_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[blit_region],
+                    vk::Filter::LINEAR,
+                );
+
+                // TRANSFER_DST_OPTIMAL -> PRESENT_SRC_KHR
+                let to_present = vk::ImageMemoryBarrier::default()
+                    .image(dst_image)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .subresource_range(color_subresource);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[], &[], &[to_present],
+                );
+
+                device.end_command_buffer(cmd)?;
+            }
+        }
+
+        // Per-image fences (created signaled so the first submit's wait
+        // is a no-op). Recycled each time we re-submit that image's cmd.
+        if self.prerecorded_blit_fences.is_none() {
+            let fence_ci = vk::FenceCreateInfo::default()
+                .flags(vk::FenceCreateFlags::SIGNALED);
+            let mut fences = Vec::with_capacity(image_count);
+            for _ in 0..image_count {
+                fences.push(unsafe { device.create_fence(&fence_ci, None) }?);
+            }
+            self.prerecorded_blit_fences = Some(fences);
+        }
+        self.prerecorded_blit_cmds = Some(cmds);
+        self.prerecorded_src_image = src_image;
+        Ok(())
     }
 
     pub fn image_count(&self) -> usize {
@@ -562,6 +702,79 @@ impl SwapchainContext {
         self.present_blit_with_wait(ctx, src_image, src_width, src_height, vk::Semaphore::null())
     }
 
+    /// Fast path used when `prepare_blit_commands` has been called and the
+    /// source image matches — skips all per-frame command-buffer recording
+    /// and just submits the pre-baked command buffer for the acquired
+    /// image.
+    fn present_blit_prerecorded(
+        &mut self,
+        ctx: &VulkanContext,
+        extra_wait: vk::Semaphore,
+    ) -> Result<()> {
+        let device = ctx.device();
+        let frame = self.current_frame;
+
+        let (image_index, _suboptimal) = unsafe {
+            self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                u64::MAX,
+                self.image_available[frame],
+                vk::Fence::null(),
+            )
+        }
+        .context("Failed to acquire next image")?;
+
+        let prerecorded_cmds = self.prerecorded_blit_cmds.as_ref().unwrap();
+        let prerecorded_fences = self.prerecorded_blit_fences.as_ref().unwrap();
+        let cmd = prerecorded_cmds[image_index as usize];
+        let image_fence = prerecorded_fences[image_index as usize];
+
+        unsafe {
+            // Per-image fence guards cmd-buffer reuse: if we cycle back to
+            // the same swapchain image before its previous blit finished
+            // on the GPU, wait here so the driver doesn't see a
+            // still-pending cmd buffer.
+            device.wait_for_fences(&[image_fence], true, u64::MAX)?;
+            device.reset_fences(&[image_fence])?;
+        }
+
+        let wait_semaphores_full: [vk::Semaphore; 2] = [self.image_available[frame], extra_wait];
+        let wait_stages_full: [vk::PipelineStageFlags; 2] =
+            [vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER];
+        let wait_count = if extra_wait == vk::Semaphore::null() { 1 } else { 2 };
+        let wait_semaphores = &wait_semaphores_full[..wait_count];
+        let wait_stages = &wait_stages_full[..wait_count];
+        let signal_semaphores = [self.render_finished[frame]];
+        let cmd_bufs = [cmd];
+        let submit_info = vk::SubmitInfo::default()
+            .wait_semaphores(wait_semaphores)
+            .wait_dst_stage_mask(wait_stages)
+            .command_buffers(&cmd_bufs)
+            .signal_semaphores(&signal_semaphores);
+
+        let gq = ctx.graphics_queue().unwrap();
+        unsafe {
+            device.queue_submit(gq.queue, &[submit_info], image_fence)?;
+        }
+
+        // Present
+        let swapchains = [self.swapchain];
+        let image_indices = [image_index];
+        let present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&signal_semaphores)
+            .swapchains(&swapchains)
+            .image_indices(&image_indices);
+
+        unsafe {
+            self.swapchain_loader
+                .queue_present(gq.queue, &present_info)
+        }
+        .context("Failed to present")?;
+
+        self.current_frame = (self.current_frame + 1) % self.max_frames_in_flight;
+        Ok(())
+    }
+
     /// Like `present_blit`, but also GPU-side waits on `extra_wait` (e.g. the
     /// renderer's `render_done_semaphore`) before performing the blit. Pass
     /// `vk::Semaphore::null()` to skip.
@@ -573,6 +786,14 @@ impl SwapchainContext {
         src_height: u32,
         extra_wait: vk::Semaphore,
     ) -> Result<()> {
+        // Fast path: use the pre-recorded command buffer baked for the
+        // matching (src_image, dst_image) pair.
+        if self.prerecorded_blit_cmds.is_some() && self.prerecorded_src_image == src_image {
+            return self.present_blit_prerecorded(ctx, extra_wait);
+        }
+
+        // Slow path: re-record per frame (legacy, used before
+        // `prepare_blit_commands` is called or if src_image doesn't match).
         let device = ctx.device();
         let frame = self.current_frame;
 
