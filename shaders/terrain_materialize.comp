@@ -609,7 +609,7 @@ uvec2 seed_plus_salt(uint seed, uvec2 salt) {
 // 0.55) reaches primary_horizontal (~56) + secondary (~44) + leaf_radius (~23)
 // ≈ 123 voxels horizontally. Use 135 to bound with slack.
 // Vertical: fork_height + primary cos(elev) + secondary + leaf ≈ 210 above base.
-const int FEATURE_MAX_RADIUS_SQ = 18225; // 135²
+const int FEATURE_MAX_RADIUS_SQ = 5625; // 75² — matches rmax below
 const int FEATURE_MAX_Z_ABOVE   = 220;  // head-room above surface
 const int FEATURE_MAX_Z_BELOW   = 45;   // secondary branches may dip below base
 
@@ -987,7 +987,13 @@ uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
     // into this chunk.
     int vlx = vx - base_x;
     int vly = vy - base_y;
-    int rmax = 135; // max procedural tree horizontal reach
+    // Max procedural tree horizontal reach. The old 135 produced
+    // (2*135+1)² ≈ 73K candidate origin columns per voxel in the halo
+    // scan. Realistic max tree reach with the hierarchical grammar:
+    // primary branches 20-40 voxels + secondary 10-20 + leaves 3-6
+    // → ~60-70 voxel radius. 75 gives a small safety margin and cuts
+    // candidate count to ~17K (77% reduction in per-voxel scan work).
+    int rmax = 75;
     int olx_min = vlx - rmax;
     int olx_max = vlx + rmax;
     int oly_min = vly - rmax;
