@@ -605,13 +605,13 @@ uvec2 seed_plus_salt(uint seed, uvec2 salt) {
 }
 
 // Maximum footprint radii (must conservatively bound the largest shape).
-// Procedural trees: crown_radius_xy up to 30 + leaf_radius ~10.5 + slack ≈ 44
-// max horizontal reach from origin. dx²+dy² up to ~44² = 1936.
-// Vertical: trunk up to 120 + crown_height up to ~80 + leaf_radius ~10 ≈ 220.
-// Droopy willows extend ~44 below the base.
-const int FEATURE_MAX_RADIUS_SQ = 2025; // 45²
+// Hierarchical procedural trees: a large jungle tree (trunk 120, primary ratio
+// 0.55) reaches primary_horizontal (~56) + secondary (~44) + leaf_radius (~23)
+// ≈ 123 voxels horizontally. Use 135 to bound with slack.
+// Vertical: fork_height + primary cos(elev) + secondary + leaf ≈ 210 above base.
+const int FEATURE_MAX_RADIUS_SQ = 18225; // 135²
 const int FEATURE_MAX_Z_ABOVE   = 220;  // head-room above surface
-const int FEATURE_MAX_Z_BELOW   = 45;   // droopy crown can extend below base
+const int FEATURE_MAX_Z_BELOW   = 45;   // secondary branches may dip below base
 
 struct FeatureParams {
     float tree_density;
@@ -668,22 +668,25 @@ FeatureParams feature_params(uint terrain, uint sub_biome) {
 }
 
 // ---------- Procedural tree parameters (mirrors Rust features.rs) ----------
-
-const uint SHAPE_ELLIPSOID = 0u;
-const uint SHAPE_CONE      = 1u;
-const uint SHAPE_FLAT_WIDE = 2u;
-const uint SHAPE_DROOPY    = 3u;
+//
+// Trees are built from a 3-level hierarchical grammar:
+//   L0 trunk              — vertical capsule
+//   L1 primary branches   — fork from fork_height
+//   L2 secondary branches — fork from primary tips
+//   L3 leaf clusters      — spheres at secondary tips
 
 struct TreeParams {
     int   trunk_height;
     float trunk_radius;
-    int   crown_base_z;
-    int   crown_height;
-    float crown_radius_xy;
-    float crown_radius_z;
-    uint  crown_shape;
-    uint  num_attractors;
-    uint  num_clusters;
+    int   fork_height;
+    int   num_primary;
+    float primary_length;
+    float primary_elev_min; // degrees from vertical
+    float primary_elev_max;
+    int   num_secondary;
+    float secondary_length;
+    float secondary_elev_min; // degrees from primary direction
+    float secondary_elev_max;
     float branch_radius;
     float leaf_radius;
     uint  canopy_material;
@@ -697,90 +700,142 @@ TreeParams tree_params_for_biome(uint terrain, int ox, int oy, uint seed) {
 
     int   trunk_height;
     float trunk_radius;
-    float crown_radius_xy;
     if (size_hash < 0.2) {
-        trunk_height    = 10 + int(h_hash * 10.0);
-        trunk_radius    = 1.0;
-        crown_radius_xy = 5.0 + h_hash * 3.0;
+        // Bush
+        trunk_height = 10 + int(h_hash * 10.0);
+        trunk_radius = 1.0;
     } else if (size_hash > 0.8) {
-        trunk_height    = 80 + int(h_hash * 40.0);
-        trunk_radius    = 2.0 + h_hash;
-        crown_radius_xy = 20.0 + h_hash * 10.0;
+        // Large tree
+        trunk_height = 80 + int(h_hash * 40.0);
+        trunk_radius = 2.5 + h_hash;
     } else {
-        trunk_height    = 40 + int(h_hash * 30.0);
-        trunk_radius    = 1.0 + h_hash * 1.5;
-        crown_radius_xy = 12.0 + h_hash * 6.0;
+        // Standard
+        trunk_height = 40 + int(h_hash * 30.0);
+        trunk_radius = 1.5 + h_hash * 1.0;
     }
 
-    uint  crown_shape;
-    uint  num_attractors;
-    uint  num_clusters;
-    float crown_stretch_z;
-    if (terrain == 6u) {        // Tundra
-        crown_shape = SHAPE_CONE;      num_attractors = 10u; num_clusters = 4u; crown_stretch_z = 1.3;
-    } else if (terrain == 0u) { // Plains
-        crown_shape = SHAPE_FLAT_WIDE; num_attractors = 12u; num_clusters = 4u; crown_stretch_z = 0.5;
+    // Biome-specific branching parameters.
+    int   num_primary;
+    int   num_secondary;
+    float fork_height_ratio;
+    float primary_elev_min;
+    float primary_elev_max;
+    float primary_length_ratio;
+    uint  canopy_material;
+    if (terrain == 0u) { // Plains
+        num_primary = 5; num_secondary = 3;
+        fork_height_ratio = 0.75;
+        primary_elev_min = 50.0; primary_elev_max = 70.0;
+        primary_length_ratio = 0.45;
+        canopy_material = 42u; // Leaves
     } else if (terrain == 9u) { // Jungle
-        crown_shape = SHAPE_CONE;      num_attractors = 20u; num_clusters = 6u; crown_stretch_z = 1.2;
+        num_primary = 3; num_secondary = 4;
+        fork_height_ratio = 0.65;
+        primary_elev_min = 30.0; primary_elev_max = 45.0;
+        primary_length_ratio = 0.55;
+        canopy_material = 37u; // JungleMoss
+    } else if (terrain == 6u) { // Tundra
+        num_primary = 5; num_secondary = 2;
+        fork_height_ratio = 0.30;
+        primary_elev_min = 25.0; primary_elev_max = 40.0;
+        primary_length_ratio = 0.35;
+        canopy_material = 42u;
     } else if (terrain == 4u) { // Swamp
-        crown_shape = SHAPE_DROOPY;    num_attractors = 14u; num_clusters = 5u; crown_stretch_z = 1.0;
-    } else {                    // Forest default
-        crown_shape = SHAPE_ELLIPSOID; num_attractors = 16u; num_clusters = 5u; crown_stretch_z = 0.9;
+        num_primary = 4; num_secondary = 3;
+        fork_height_ratio = 0.50;
+        primary_elev_min = 10.0; primary_elev_max = 30.0;
+        primary_length_ratio = 0.45;
+        canopy_material = 42u;
+    } else { // Forest default
+        num_primary = 4; num_secondary = 3;
+        fork_height_ratio = 0.55;
+        primary_elev_min = 35.0; primary_elev_max = 55.0;
+        primary_length_ratio = 0.40;
+        canopy_material = 42u;
     }
+
+    float primary_length   = float(trunk_height) * primary_length_ratio;
+    float secondary_length = primary_length * 0.55;
 
     TreeParams tp;
-    tp.trunk_height    = trunk_height;
-    tp.trunk_radius    = trunk_radius;
-    tp.crown_base_z    = int(float(trunk_height) * 0.55);
-    tp.crown_height    = int(crown_radius_xy * 2.0 * crown_stretch_z);
-    tp.crown_radius_xy = crown_radius_xy;
-    tp.crown_radius_z  = crown_radius_xy * crown_stretch_z;
-    tp.crown_shape     = crown_shape;
-    tp.num_attractors  = num_attractors;
-    tp.num_clusters    = num_clusters;
-    tp.branch_radius   = max(trunk_radius * 0.4, 0.7);
-    tp.leaf_radius     = max(crown_radius_xy * 0.35, 1.5);
-    tp.canopy_material = (terrain == 9u) ? 37u /*JungleMoss*/ : 42u /*Leaves*/;
+    tp.trunk_height      = trunk_height;
+    tp.trunk_radius      = trunk_radius;
+    tp.fork_height       = int(float(trunk_height) * fork_height_ratio);
+    tp.num_primary       = num_primary;
+    tp.primary_length    = primary_length;
+    tp.primary_elev_min  = primary_elev_min;
+    tp.primary_elev_max  = primary_elev_max;
+    tp.num_secondary     = num_secondary;
+    tp.secondary_length  = secondary_length;
+    tp.secondary_elev_min = 40.0;
+    tp.secondary_elev_max = 70.0;
+    tp.branch_radius     = max(trunk_radius * 0.55, 0.8);
+    tp.leaf_radius       = max(primary_length * 0.35, 2.5);
+    tp.canopy_material   = canopy_material;
     return tp;
 }
 
-// Mirrors Rust attractor(). Uses seed.wrapping_add(0xA77A) as the u64 base.
-// 0xA77A fits in the low 32 bits; the salt has hi=0.
-const uvec2 SALT_TREE_ATTR = uvec2(0x00000000u, 0x0000A77Au);
+// Salts for branch jitter hashes. Match Rust seed.wrapping_add(0xB12x) / 0xB13x.
+const uvec2 SALT_PRIMARY_ANGLE  = uvec2(0x00000000u, 0x0000B120u);
+const uvec2 SALT_PRIMARY_ELEV   = uvec2(0x00000000u, 0x0000B121u);
+const uvec2 SALT_PRIMARY_LENGTH = uvec2(0x00000000u, 0x0000B122u);
+const uvec2 SALT_SEC_ANGLE      = uvec2(0x00000000u, 0x0000B130u);
+const uvec2 SALT_SEC_ELEV       = uvec2(0x00000000u, 0x0000B131u);
+const uvec2 SALT_SEC_LENGTH     = uvec2(0x00000000u, 0x0000B132u);
 
-vec3 tree_attractor(uint i, int ox, int oy, uint seed, TreeParams tp) {
-    uvec2 s = seed_plus_salt(seed, SALT_TREE_ATTR);
-    int iz1 = int(i) * 7 + 1;
-    int iz2 = int(i) * 7 + 2;
-    int iz3 = int(i) * 7 + 3;
-    float h1 = hash_f32_u64_full(ox, oy, iz1, s);
-    float h2 = hash_f32_u64_full(ox, oy, iz2, s);
-    float h3 = hash_f32_u64_full(ox, oy, iz3, s);
+// Returns (dx, dy, dz) relative to the fork point for the i-th primary branch.
+vec3 primary_branch_end(int i, int ox, int oy, uint seed, TreeParams tp) {
+    float n = float(tp.num_primary);
+    float angle_base = float(i) * 6.28318530717958647692 / n;
+    float aj = hash_f32_u64_full(ox, oy, i * 11 + 1, seed_plus_salt(seed, SALT_PRIMARY_ANGLE));
+    float angle = angle_base + (aj - 0.5) * (6.28318530717958647692 / n) * 0.3;
 
-    float angle = h1 * 2.0 * 3.14159265358979323846;
-    float t_z = h3;
+    float eh = hash_f32_u64_full(ox, oy, i * 11 + 2, seed_plus_salt(seed, SALT_PRIMARY_ELEV));
+    float elev_deg = tp.primary_elev_min + eh * (tp.primary_elev_max - tp.primary_elev_min);
+    float elev_rad = elev_deg * 3.14159265358979323846 / 180.0;
 
-    float radius_factor;
-    if (tp.crown_shape == SHAPE_ELLIPSOID || tp.crown_shape == SHAPE_FLAT_WIDE) {
-        float z_norm = 2.0 * t_z - 1.0;
-        radius_factor = sqrt(max(1.0 - z_norm * z_norm, 0.0));
-    } else if (tp.crown_shape == SHAPE_CONE) {
-        radius_factor = 1.0 - t_z;
-    } else { // SHAPE_DROOPY
-        radius_factor = (t_z < 0.3) ? 1.0 : (1.0 - (t_z - 0.3) / 0.7);
-    }
+    float lh = hash_f32_u64_full(ox, oy, i * 11 + 3, seed_plus_salt(seed, SALT_PRIMARY_LENGTH));
+    float length = tp.primary_length * (0.8 + lh * 0.4);
 
-    float radius = sqrt(h2) * tp.crown_radius_xy * radius_factor;
-    float dx = cos(angle) * radius;
-    float dy = sin(angle) * radius;
-
-    float dz;
-    if (tp.crown_shape == SHAPE_DROOPY) {
-        dz = float(tp.crown_base_z) + (t_z - 0.3) * float(tp.crown_height);
-    } else {
-        dz = float(tp.crown_base_z) + t_z * float(tp.crown_height);
-    }
+    float horiz = length * sin(elev_rad);
+    float dx = cos(angle) * horiz;
+    float dy = sin(angle) * horiz;
+    float dz = length * cos(elev_rad);
     return vec3(dx, dy, dz);
+}
+
+// Returns (dx, dy, dz) relative to the primary branch END for the j-th
+// secondary branch off the i-th primary.
+vec3 secondary_branch_end(int i, int j, vec3 primary_end, int ox, int oy, uint seed, TreeParams tp) {
+    float plen = max(length(primary_end), 0.001);
+    vec3 pdir = primary_end / plen;
+
+    float m = float(tp.num_secondary);
+    float angle_base = float(j) * 6.28318530717958647692 / m;
+    int hi = (i * 17 + j) * 11;
+    float aj = hash_f32_u64_full(ox, oy, hi + 1, seed_plus_salt(seed, SALT_SEC_ANGLE));
+    float angle = angle_base + (aj - 0.5) * 0.8;
+
+    float eh = hash_f32_u64_full(ox, oy, hi + 2, seed_plus_salt(seed, SALT_SEC_ELEV));
+    float elev_deg = tp.secondary_elev_min + eh * (tp.secondary_elev_max - tp.secondary_elev_min);
+    float elev_rad = elev_deg * 3.14159265358979323846 / 180.0;
+
+    float lh = hash_f32_u64_full(ox, oy, hi + 3, seed_plus_salt(seed, SALT_SEC_LENGTH));
+    float length_s = tp.secondary_length * (0.8 + lh * 0.4);
+
+    // Orthonormal basis (u, v) perpendicular to pdir.
+    vec3 helper = (abs(pdir.z) < 0.9) ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 cu = cross(pdir, helper);
+    float ulen = max(length(cu), 0.001);
+    vec3 u = cu / ulen;
+    vec3 v = cross(pdir, u);
+
+    float c_elev = cos(elev_rad);
+    float s_elev = sin(elev_rad);
+    float c_ang  = cos(angle);
+    float s_ang  = sin(angle);
+    vec3 dir = c_elev * pdir + s_elev * (c_ang * u + s_ang * v);
+    return dir * length_s;
 }
 
 // Capsule SDF (signed distance). Negative inside.
@@ -799,8 +854,8 @@ float sphere_sdf(vec3 p, vec3 c, float r) {
 
 // Try to place a tree at origin (ox,oy) and test whether it covers (vx,vy,vz).
 // Returns the override material or 0xFFFFFFFFu if not covered.
-// `covered_by_trunk` out-param flags whether the covered voxel is a trunk or
-// branch voxel (used by leaves to skip overwriting the trunk).
+// `covered_by_trunk` out-param flags whether the covered voxel is a trunk/branch
+// voxel (used by leaves to skip overwriting trunk).
 uint try_tree_at(int ox, int oy, int vx, int vy, int vz, int feature_base_z,
                  uint seed, FeatureParams fp, uint terrain, out bool covered_by_trunk) {
     covered_by_trunk = false;
@@ -816,48 +871,52 @@ uint try_tree_at(int ox, int oy, int vx, int vy, int vz, int feature_base_z,
 
     vec3 p = vec3(float(vx), float(vy), float(vz));
     vec3 origin_base = vec3(float(ox), float(oy), float(feature_base_z));
+    vec3 fork_pt = origin_base + vec3(0.0, 0.0, float(tp.fork_height));
 
-    // Trunk capsule.
+    // 1. Trunk capsule.
     vec3 trunk_a = origin_base;
     vec3 trunk_b = origin_base + vec3(0.0, 0.0, float(tp.trunk_height));
-    float trunk_d = capsule_sdf(p, trunk_a, trunk_b, tp.trunk_radius);
-    if (trunk_d <= 0.0) {
+    if (capsule_sdf(p, trunk_a, trunk_b, tp.trunk_radius) <= 0.0) {
         covered_by_trunk = true;
         return MAT_WOOD_LOG;
     }
 
-    // Compute cluster centroids and branch capsules.
-    // Each attractor is assigned to cluster (i % num_clusters). We stream
-    // through attractors twice: once to compute centroids, once to test
-    // leaf spheres. This matches the Rust reference implementation.
-    float min_branch = 1e9;
-    for (uint ci = 0u; ci < tp.num_clusters; ci++) {
-        vec3 sum = vec3(0.0);
-        uint cnt = 0u;
-        for (uint j = 0u; j < tp.num_attractors; j++) {
-            if ((j % tp.num_clusters) != ci) continue;
-            sum += tree_attractor(j, ox, oy, seed, tp);
-            cnt++;
+    // 2. Primary branches.
+    int np = min(tp.num_primary, 8);
+    int ns = min(tp.num_secondary, 8);
+    for (int i = 0; i < np; i++) {
+        vec3 pend_rel = primary_branch_end(i, ox, oy, seed, tp);
+        vec3 pend     = fork_pt + pend_rel;
+        if (capsule_sdf(p, fork_pt, pend, tp.branch_radius) <= 0.0) {
+            covered_by_trunk = true;
+            return MAT_WOOD_LOG;
         }
-        vec3 ctd = (cnt > 0u) ? (sum / float(cnt)) : vec3(0.0);
-
-        float t_along = (float(ci) / float(tp.num_clusters)) * 0.4 + 0.55;
-        vec3 branch_a = origin_base + vec3(0.0, 0.0, float(tp.trunk_height) * t_along);
-        vec3 branch_b = origin_base + ctd;
-        float d = capsule_sdf(p, branch_a, branch_b, tp.branch_radius);
-        if (d < min_branch) min_branch = d;
-    }
-    if (min_branch <= 0.0) {
-        covered_by_trunk = true;
-        return MAT_WOOD_LOG;
     }
 
-    // Leaf spheres.
-    for (uint i = 0u; i < tp.num_attractors; i++) {
-        vec3 attr = tree_attractor(i, ox, oy, seed, tp);
-        vec3 leaf_c = origin_base + attr;
-        if (sphere_sdf(p, leaf_c, tp.leaf_radius) <= 0.0) {
-            return tp.canopy_material;
+    // 3. Secondary branches.
+    for (int i = 0; i < np; i++) {
+        vec3 pend_rel = primary_branch_end(i, ox, oy, seed, tp);
+        vec3 pend     = fork_pt + pend_rel;
+        for (int j = 0; j < ns; j++) {
+            vec3 send_rel = secondary_branch_end(i, j, pend_rel, ox, oy, seed, tp);
+            vec3 send     = pend + send_rel;
+            if (capsule_sdf(p, pend, send, tp.branch_radius * 0.55) <= 0.0) {
+                covered_by_trunk = true;
+                return MAT_WOOD_LOG;
+            }
+        }
+    }
+
+    // 4. Leaf spheres at secondary tips.
+    for (int i = 0; i < np; i++) {
+        vec3 pend_rel = primary_branch_end(i, ox, oy, seed, tp);
+        vec3 pend     = fork_pt + pend_rel;
+        for (int j = 0; j < ns; j++) {
+            vec3 send_rel = secondary_branch_end(i, j, pend_rel, ox, oy, seed, tp);
+            vec3 send     = pend + send_rel;
+            if (sphere_sdf(p, send, tp.leaf_radius) <= 0.0) {
+                return tp.canopy_material;
+            }
         }
     }
 
@@ -925,7 +984,7 @@ uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
     // into this chunk.
     int vlx = vx - base_x;
     int vly = vy - base_y;
-    int rmax = 45; // max procedural tree horizontal reach
+    int rmax = 135; // max procedural tree horizontal reach
     int olx_min = vlx - rmax;
     int olx_max = vlx + rmax;
     int oly_min = vly - rmax;
