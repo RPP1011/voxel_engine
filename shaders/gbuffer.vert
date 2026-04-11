@@ -20,10 +20,14 @@ void main() {
     frag_entry_pos = grid_pos;
     frag_camera_pos = pc.camera_pos.xyz;
 
-    // Inflate by ~1 voxel to close rasterization gaps between adjacent
-    // cubes at low render resolution.  Back-face discard in the fragment
-    // shader prevents z-fighting from the overlap region.
-    float eps = 1.0 / max(pc.grid_dim.x, max(pc.grid_dim.y, pc.grid_dim.z));
-    vec3 inflated = mix(vec3(-eps), vec3(1.0 + eps), in_position);
-    gl_Position = pc.mvp * vec4(inflated, 1.0);
+    // NOTE: a previous revision inflated the cube by `eps = 1/grid_dim`
+    // to close low-res rasterization gaps, but that caused visible
+    // camera warping because `frag_entry_pos` was computed from the
+    // uninflated `in_position` while `gl_Position` used the inflated
+    // one. The rasterizer interpolated `frag_entry_pos` across the
+    // 3%-larger cube footprint, stretching the DDA ray entry
+    // positions and producing geometric warping near cube edges.
+    // Using the raw unit cube eliminates the mismatch; any
+    // remaining rasterization seams can be addressed separately.
+    gl_Position = pc.mvp * vec4(in_position, 1.0);
 }
