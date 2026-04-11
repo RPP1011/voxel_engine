@@ -878,34 +878,15 @@ impl VoxelRenderer {
         // Pass 1: GBuffer
         self.gbuffer.record_batch(device, cmd, &self.gbuffer_pipeline, &batch_objects);
 
-        // Pass 2: Shadow map (first chunk as representative)
-        if let Some((_v, _palette_color, position, dims)) = views.first() {
-            let max_dim = dims[0].max(dims[1]).max(dims[2]);
-            let sun_dir = normalize_v([0.5, 0.8, 0.3]);
-            let sun_model = scale3_translate_matrix(dims[0], dims[1], dims[2], position[0], position[1], position[2]);
-            let sun_view_mat = build_sun_view(&sun_dir, position, max_dim);
-            let half = max_dim * 2.0;
-            let dist = max_dim * 3.0;
-            let sun_proj = ortho(-half, half, -half, half, 0.1, dist * 2.0);
-            let sun_mvp = mat4_mul(&sun_proj, &mat4_mul(&sun_view_mat, &sun_model));
-            let grid_dim_v = [dims[0], dims[1], dims[2], 0.0f32];
+        // NOTE: There used to be a shadow-map pass here. It rendered one
+        // chunk cube per frame into a depth-only render target, but no
+        // downstream shader ever sampled that depth map — the deferred
+        // light shader only reads albedo/normal/material. The pass was
+        // pure dead work (another 480×270 raymarching draw) and has been
+        // removed. The shadow_map field is still allocated (for API
+        // compatibility) but no longer drawn into.
 
-            let mut shadow_push = [0u8; 128];
-            shadow_push[0..64].copy_from_slice(bytemuck::cast_slice(&sun_mvp));
-            shadow_push[64..80].copy_from_slice(bytemuck::cast_slice(&grid_dim_v));
-            let sun_eye = [position[0]+sun_dir[0]*dist, position[1]+sun_dir[1]*dist, position[2]+sun_dir[2]*dist];
-            let sun_cam = [sun_eye[0], sun_eye[1], sun_eye[2], 0.0f32];
-            shadow_push[80..96].copy_from_slice(bytemuck::cast_slice(&sun_cam));
-
-            let shadow_desc = self.obj_shadow_desc_set.unwrap();
-            self.shadow_map.record_render(
-                device, cmd, &self.shadow_pipeline,
-                self.gbuffer.unit_vb(), self.gbuffer.unit_ib(), 36,
-                &shadow_push, shadow_desc,
-            );
-        }
-
-        // Pass 3: Transition GBuffer RTs for sampling
+        // Transition GBuffer RTs for sampling
         self.gbuffer.record_transition_for_sampling(device, cmd);
 
         // Pass 4: Deferred sun light pass

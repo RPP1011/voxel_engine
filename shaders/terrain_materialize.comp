@@ -876,6 +876,32 @@ uint try_tree_at(int ox, int oy, int vx, int vy, int vz, int feature_base_z,
     vec3 origin_base = vec3(float(ox), float(oy), float(feature_base_z));
     vec3 fork_pt = origin_base + vec3(0.0, 0.0, float(tp.fork_height));
 
+    // Bounding-sphere rejection: the tree fits inside a sphere centered at
+    // fork_pt with radius (primary_length + secondary_length + leaf_radius +
+    // branch_radius_slop). If the voxel is outside that sphere and also
+    // above/below the trunk's Z range, we can skip all 137 SDF evaluations
+    // for this origin. Most origins in the halo are far from any given voxel
+    // — this test kicks ~85% of them out before the SDF pass.
+    float tree_max_reach = tp.primary_length + tp.secondary_length
+                         + tp.leaf_radius + tp.branch_radius + 1.0;
+    float tree_max_reach_sq = tree_max_reach * tree_max_reach;
+    vec3 fork_to_p = p - fork_pt;
+    if (dot(fork_to_p, fork_to_p) > tree_max_reach_sq) {
+        // Also check trunk Z range (trunk extends down from fork to origin_base)
+        float trunk_low  = float(feature_base_z) - tp.trunk_radius;
+        float trunk_high = float(feature_base_z + tp.trunk_height) + tp.trunk_radius;
+        float vx_dx = float(vx - ox);
+        float vy_dy = float(vy - oy);
+        float trunk_dist_sq = vx_dx * vx_dx + vy_dy * vy_dy;
+        float trunk_r_sq = tp.trunk_radius * tp.trunk_radius + 1.0;
+        bool inside_trunk_column = trunk_dist_sq <= trunk_r_sq
+                                 && float(vz) >= trunk_low
+                                 && float(vz) <= trunk_high;
+        if (!inside_trunk_column) {
+            return 0xFFFFFFFFu;
+        }
+    }
+
     // 1. Trunk capsule.
     vec3 trunk_a = origin_base;
     vec3 trunk_b = origin_base + vec3(0.0, 0.0, float(tp.trunk_height));
