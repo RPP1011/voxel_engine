@@ -701,17 +701,17 @@ TreeParams tree_params_for_biome(uint terrain, int ox, int oy, uint seed) {
     int   trunk_height;
     float trunk_radius;
     if (size_hash < 0.2) {
-        // Bush
+        // Bush: 10-20 voxels, thin trunk ~10cm
         trunk_height = 10 + int(h_hash * 10.0);
         trunk_radius = 1.0;
     } else if (size_hash > 0.8) {
-        // Large tree
+        // Large tree: 80-120 voxels, thick trunk 40-60cm diameter
         trunk_height = 80 + int(h_hash * 40.0);
-        trunk_radius = 2.5 + h_hash;
+        trunk_radius = 3.5 + h_hash * 1.5;
     } else {
-        // Standard
+        // Standard: 40-70, trunk 25-40cm diameter
         trunk_height = 40 + int(h_hash * 30.0);
-        trunk_radius = 1.5 + h_hash * 1.0;
+        trunk_radius = 2.0 + h_hash * 1.0;
     }
 
     // Biome-specific branching parameters.
@@ -769,8 +769,11 @@ TreeParams tree_params_for_biome(uint terrain, int ox, int oy, uint seed) {
     tp.secondary_length  = secondary_length;
     tp.secondary_elev_min = 40.0;
     tp.secondary_elev_max = 70.0;
-    tp.branch_radius     = max(trunk_radius * 0.55, 0.8);
-    tp.leaf_radius       = max(primary_length * 0.35, 2.5);
+    tp.branch_radius     = max(trunk_radius * 0.5, 1.0);
+    // Small leaf clusters so trees stay visually distinct. At 10cm/voxel a
+    // real cluster is 40-80cm diameter (2-4 voxel radius), plus a small
+    // size-proportional bump.
+    tp.leaf_radius       = clamp(2.5 + primary_length * 0.08, 2.0, 5.5);
     tp.canopy_material   = canopy_material;
     return tp;
 }
