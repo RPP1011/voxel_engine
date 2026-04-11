@@ -83,9 +83,24 @@ impl GBuffer {
             .depth_stencil_attachment(&depth_ref);
 
         let subpasses = [subpass];
+        // Explicit subpass→EXTERNAL dependency so the deferred light pass
+        // that samples these RTs sees a consistent result without needing a
+        // separate vkCmdPipelineBarrier after vkCmdEndRenderPass. The
+        // default subpass dependency is a weak TOP_OF_PIPE → BOTTOM_OF_PIPE
+        // with no access masks — it doesn't guarantee the color-attachment
+        // writes are visible to a fragment-shader read. This one does.
+        let dependencies = [vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .dependency_flags(vk::DependencyFlags::BY_REGION)];
         let rp_ci = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
-            .subpasses(&subpasses);
+            .subpasses(&subpasses)
+            .dependencies(&dependencies);
         let render_pass = unsafe { device.create_render_pass(&rp_ci, None) }?;
 
         // Create RT images

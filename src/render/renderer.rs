@@ -886,8 +886,14 @@ impl VoxelRenderer {
         // removed. The shadow_map field is still allocated (for API
         // compatibility) but no longer drawn into.
 
-        // Transition GBuffer RTs for sampling
-        self.gbuffer.record_transition_for_sampling(device, cmd);
+        // NOTE: previously there was a `record_transition_for_sampling` call
+        // here that issued three vkCmdPipelineBarrier calls to move the
+        // gbuffer RTs from TRANSFER_SRC_OPTIMAL to SHADER_READ_ONLY_OPTIMAL.
+        // It was both *redundant* (the render pass's final_layout already
+        // transitions the attachments to SHADER_READ_ONLY_OPTIMAL at end)
+        // and *incorrect* (old_layout didn't match the actual layout). Each
+        // extraneous barrier causes a cache flush / pipeline drain; on this
+        // GPU that was a non-trivial chunk of the wait bucket. Removed.
 
         // Pass 4: Deferred sun light pass
         let sun_dir = normalize_v([0.5, 0.8, 0.3]);
