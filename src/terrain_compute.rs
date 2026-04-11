@@ -1028,6 +1028,29 @@ impl TerrainComputePipeline {
         chunk_pos: ChunkKey,
         seed: u32,
     ) -> Result<Option<u64>> {
+        self.submit_chunk_with_frame(ctx, chunk_pos, seed, u64::MAX)
+    }
+
+    /// Variant that refuses eviction if the least-recently-used Loaded slot
+    /// was touched on or after `current_frame` — i.e. every in-pool chunk is
+    /// still being sampled by the current render. In that case we return
+    /// `Ok(None)` without submitting, signalling the caller to stop trying
+    /// to load more (the pool is saturated with in-view chunks).
+    ///
+    /// Without this guard, a spiral that visits more chunks than the pool
+    /// can hold keeps LRU-evicting currently-visible chunks, forcing a
+    /// re-compute next frame and holding the compute queue at 100%
+    /// utilization even though all the "new" chunks are chunks the pool
+    /// just held a frame ago. That steady-state churn was the single
+    /// biggest cost in our frame time (compute stealing GPU SMs from
+    /// graphics).
+    pub fn submit_chunk_with_frame(
+        &mut self,
+        ctx: &VulkanContext,
+        chunk_pos: ChunkKey,
+        seed: u32,
+        current_frame: u64,
+    ) -> Result<Option<u64>> {
         // 1. If this chunk is already known to the pool, no-op.
         if self
             .slots
@@ -1047,9 +1070,17 @@ impl TerrainComputePipeline {
                     .enumerate()
                     .filter(|(_, s)| matches!(s.state, SlotState::Loaded(_)))
                     .min_by_key(|(_, s)| s.last_touched_frame)
-                    .map(|(i, _)| i);
+                    .map(|(i, s)| (i, s.last_touched_frame));
                 match oldest {
-                    Some(i) => i,
+                    Some((i, oldest_frame)) => {
+                        // Refuse eviction if the LRU slot was touched this
+                        // frame or the previous one — it's still part of
+                        // the current render set.
+                        if current_frame != u64::MAX && oldest_frame + 1 >= current_frame {
+                            return Ok(None);
+                        }
+                        i
+                    }
                     // All slots are InFlight — caller should retry later.
                     None => return Ok(None),
                 }
@@ -1313,6 +1344,22 @@ impl TerrainComputePipeline {
         &mut self,
         ctx: &VulkanContext,
     ) -> Result<Vec<(u64, ChunkKey)>> {
+        self.try_take_completed_with_frame(ctx, 0)
+    }
+
+    /// Variant that also stamps freshly-completed slots with the current
+    /// frame as their `last_touched_frame`. Without this, a slot that's just
+    /// finished its compute dispatch has a stale last_touched value from
+    /// when it was last populated (or 0 if it's a new slot), which makes
+    /// it look like an LRU eviction target to the very next
+    /// `submit_chunk_with_frame` call — and since that call happens in
+    /// the same frame as drain, fresh chunks would be evicted before the
+    /// renderer even got a chance to mark them touched.
+    pub fn try_take_completed_with_frame(
+        &mut self,
+        ctx: &VulkanContext,
+        current_frame: u64,
+    ) -> Result<Vec<(u64, ChunkKey)>> {
         let device = ctx.device();
         let mut completed = Vec::new();
         for slot in self.slots.iter_mut() {
@@ -1324,6 +1371,7 @@ impl TerrainComputePipeline {
             match status {
                 Ok(true) => {
                     slot.state = SlotState::Loaded(slot.chunk_pos);
+                    slot.last_touched_frame = current_frame;
                     completed.push((request_id, slot.chunk_pos));
                 }
                 Ok(false) => {
