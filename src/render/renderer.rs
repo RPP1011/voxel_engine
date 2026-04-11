@@ -62,6 +62,12 @@ pub struct VoxelRenderer {
     /// Hash of image view handles used to build the cached descriptor sets.
     /// When this changes (texture upload/evict), we rebuild.
     cached_obj_hash: u64,
+    /// Persistent per-slot cache for the pool-rendering path. Keyed by the
+    /// chunk's main image view handle (stable per pool slot). Populated
+    /// lazily by `rebuild_pool_descriptors`. This replaces the old destroy-
+    /// and-recreate pool-rebuild on every visible-set change, which was the
+    /// source of multi-millisecond raycast spikes during pool fill-up.
+    obj_pool_desc_cache: std::collections::HashMap<u64, vk::DescriptorSet>,
     voxel_sampler: vk::Sampler,
     // Pre-allocated Vulkan objects to avoid per-frame alloc/free
     render_cmd: [vk::CommandBuffer; 2],
@@ -278,6 +284,7 @@ impl VoxelRenderer {
             obj_gbuf_desc_sets: Vec::new(),
             obj_shadow_desc_set: None,
             cached_obj_hash: 0,
+            obj_pool_desc_cache: std::collections::HashMap::new(),
             voxel_sampler,
             render_cmd,
             render_fence,
@@ -684,133 +691,105 @@ impl VoxelRenderer {
         Ok(())
     }
 
-    /// Rebuild cached per-object descriptor sets from pool-resident
-    /// [`LoadedChunkView`]s. Mirrors [`rebuild_object_descriptors`] but reads
-    /// image views from the pool struct and uses a shared palette view
-    /// instead of per-object palettes.
+    /// Populate the per-visible-chunk descriptor set list for the pool
+    /// render path using a persistent cache keyed by main image view.
+    ///
+    /// The terrain compute pool holds at most 256 slots and each slot owns
+    /// a stable set of image views (main + 3 mip levels) for the lifetime
+    /// of the renderer. We lazily allocate and write one descriptor set
+    /// per unique main_view the first time we see it, then reuse it on
+    /// every subsequent frame. The previous implementation destroyed and
+    /// rebuilt the entire pool every time the visible set changed — which
+    /// was every frame during pool fill-up, costing up to ~2ms of raycast
+    /// latency spikes from allocating 100+ descriptor sets at once.
     fn rebuild_pool_descriptors(
         &mut self,
         ctx: &VulkanContext,
         views: &[(LoadedChunkView, [f32; 4], [f32; 3], [f32; 3])],
         palette_view: vk::ImageView,
     ) -> Result<()> {
-        // Hash: palette + all main image views. Order-INDEPENDENT XOR so a
-        // simple camera rotation (which re-sorts visible chunks by distance
-        // but doesn't change the set) doesn't thrash the descriptor pool.
-        // Rebuilding descriptor sets destroys + recreates the pool plus
-        // N * vkAllocateDescriptorSets + N * vkUpdateDescriptorSets, which
-        // gets expensive at 50+ visible chunks.
-        let mut obj_hash: u64 = 0xcbf29ce484222325;
-        obj_hash ^= (views.len() as u64).wrapping_mul(0x9e3779b97f4a7c15);
-        obj_hash ^= (palette_view.as_raw() as u64).wrapping_mul(0x9e3779b97f4a7c15);
-        let mut view_xor: u64 = 0;
-        for (v, _, _, _) in views {
-            view_xor ^= (v.main_view.as_raw() as u64).wrapping_mul(0x9e3779b97f4a7c15);
-        }
-        obj_hash ^= view_xor;
-        if obj_hash == self.cached_obj_hash && self.obj_desc_pool.is_some() {
-            return Ok(());
-        }
-
         let device = ctx.device();
 
-        if let Some(pool) = self.obj_desc_pool.take() {
-            unsafe { device.destroy_descriptor_pool(pool, None) };
-        }
-        self.obj_gbuf_desc_sets.clear();
-        self.obj_shadow_desc_set = None;
-
-        let obj_count = views.len().max(1) as u32;
-
-        let pool = {
+        // One-time pool creation: size generously for the full pool slot
+        // count (256) × 5 bindings each. Allocations are reused forever.
+        if self.obj_desc_pool.is_none() {
+            const POOL_SLOT_COUNT: u32 = 256;
+            const BINDINGS_PER_SET: u32 = 5;
             let ps = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(obj_count * 5 + 1)];
-            unsafe {
+                .descriptor_count(POOL_SLOT_COUNT * BINDINGS_PER_SET + 8)];
+            let pool = unsafe {
                 device.create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(obj_count + 1)
+                        .max_sets(POOL_SLOT_COUNT + 8)
                         .pool_sizes(&ps),
                     None,
                 )
-            }?
-        };
-
+            }?;
+            self.obj_desc_pool = Some(pool);
+        }
+        let pool = self.obj_desc_pool.unwrap();
         let gbuf_dsl = self.gbuffer_pipeline.descriptor_set_layout.unwrap();
+
+        // Rebuild the visible-chunk descriptor set list from the cache,
+        // allocating + writing new entries only for chunks we haven't seen.
+        self.obj_gbuf_desc_sets.clear();
+        self.obj_gbuf_desc_sets.reserve(views.len());
         for (v, _palette_color, _position, _grid_dims) in views.iter() {
-            let layouts = [gbuf_dsl];
-            let desc_set = unsafe {
-                device.allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(pool)
-                        .set_layouts(&layouts),
-                )
-            }?[0];
+            let key = v.main_view.as_raw();
+            let desc_set = match self.obj_pool_desc_cache.get(&key) {
+                Some(&ds) => ds,
+                None => {
+                    let layouts = [gbuf_dsl];
+                    let ds = unsafe {
+                        device.allocate_descriptor_sets(
+                            &vk::DescriptorSetAllocateInfo::default()
+                                .descriptor_pool(pool)
+                                .set_layouts(&layouts),
+                        )
+                    }?[0];
 
-            // NOTE: binding layout matches gbuffer.frag:
-            //   0 = voxel_grid (main), 1 = mip1, 2 = mip2, 3 = palette, 4 = mip3
-            let img_infos = [
-                vk::DescriptorImageInfo::default()
-                    .sampler(self.voxel_sampler)
-                    .image_view(v.main_view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                vk::DescriptorImageInfo::default()
-                    .sampler(self.voxel_sampler)
-                    .image_view(v.mip1_view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                vk::DescriptorImageInfo::default()
-                    .sampler(self.voxel_sampler)
-                    .image_view(v.mip2_view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                vk::DescriptorImageInfo::default()
-                    .sampler(self.sampler)
-                    .image_view(palette_view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                vk::DescriptorImageInfo::default()
-                    .sampler(self.voxel_sampler)
-                    .image_view(v.mip3_view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            ];
-            let writes: Vec<vk::WriteDescriptorSet> = (0..5)
-                .map(|i| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(desc_set)
-                        .dst_binding(i as u32)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .image_info(std::slice::from_ref(&img_infos[i]))
-                })
-                .collect();
-            unsafe { device.update_descriptor_sets(&writes, &[]) };
+                    // NOTE: binding layout matches gbuffer.frag:
+                    //   0 = voxel_grid (main), 1 = mip1, 2 = mip2, 3 = palette, 4 = mip3
+                    let img_infos = [
+                        vk::DescriptorImageInfo::default()
+                            .sampler(self.voxel_sampler)
+                            .image_view(v.main_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                        vk::DescriptorImageInfo::default()
+                            .sampler(self.voxel_sampler)
+                            .image_view(v.mip1_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                        vk::DescriptorImageInfo::default()
+                            .sampler(self.voxel_sampler)
+                            .image_view(v.mip2_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                        vk::DescriptorImageInfo::default()
+                            .sampler(self.sampler)
+                            .image_view(palette_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                        vk::DescriptorImageInfo::default()
+                            .sampler(self.voxel_sampler)
+                            .image_view(v.mip3_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                    ];
+                    let writes: Vec<vk::WriteDescriptorSet> = (0..5)
+                        .map(|i| {
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(ds)
+                                .dst_binding(i as u32)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .image_info(std::slice::from_ref(&img_infos[i]))
+                        })
+                        .collect();
+                    unsafe { device.update_descriptor_sets(&writes, &[]) };
 
+                    self.obj_pool_desc_cache.insert(key, ds);
+                    ds
+                }
+            };
             self.obj_gbuf_desc_sets.push(desc_set);
         }
-
-        if let Some((v, _, _, _)) = views.first() {
-            let shadow_dsl = self.shadow_pipeline.descriptor_set_layout.unwrap();
-            let shadow_layouts = [shadow_dsl];
-            let shadow_desc = unsafe {
-                device.allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(pool)
-                        .set_layouts(&shadow_layouts),
-                )
-            }?[0];
-            let shadow_img = [vk::DescriptorImageInfo::default()
-                .sampler(self.voxel_sampler)
-                .image_view(v.main_view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let shadow_write = [vk::WriteDescriptorSet::default()
-                .dst_set(shadow_desc)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&shadow_img)];
-            unsafe { device.update_descriptor_sets(&shadow_write, &[]) };
-            self.obj_shadow_desc_set = Some(shadow_desc);
-        }
-
-        self.obj_desc_pool = Some(pool);
-        self.cached_obj_hash = obj_hash;
-
         Ok(())
     }
 
