@@ -1,11 +1,30 @@
 #version 450
 
-// Force depth test BEFORE fragment shader runs. Without this, the
-// discard statements below force late fragment tests, meaning every
-// occluded fragment still runs the full DDA raymarch before being
-// thrown away. With early_fragment_tests + front-to-back draw order,
-// back chunks that are occluded by front chunks skip the DDA entirely.
-layout(early_fragment_tests) in;
+// NO early_fragment_tests. The DDA shader writes gl_FragDepth for the
+// *actual* voxel hit position, which is always deeper than the
+// rasterizer's interpolated cube front-face depth. With early
+// fragment tests, the GLSL spec says the depth WRITE happens before
+// the shader runs, using the interpolated (front-face) depth — and
+// that write is NOT undone by a subsequent discard. So a mostly-empty
+// near chunk would stamp its cube front-face depth into every pixel
+// its cube rasterizes, then discard most of those fragments because
+// the DDA finds no voxel. Further chunks' fragments at the same
+// pixels then fail the depth test against the stale near-chunk depth
+// and never get drawn — visible as the "air in a partially-filled
+// front chunk occludes everything behind it" bug.
+//
+// Letting the depth test happen *after* the shader means:
+//   - shader runs, DDA marches through the cube
+//   - if no voxel: discard → no depth write, no color write, next
+//     chunk's fragment at this pixel can run normally
+//   - if voxel hit: gl_FragDepth = real hit depth → late depth
+//     write uses the actual hit, so only the closest ACTUAL voxel
+//     wins (not the closest cube front face)
+//
+// Perf cost: every rasterized fragment runs DDA instead of being
+// pre-culled by early Z. At multi-GFPS the DDA is essentially free
+// (a few hundred cycles worst case, single-digit ns). Correctness
+// wins easily.
 
 layout(location = 0) in vec3 frag_entry_pos;
 layout(location = 1) flat in vec3 frag_camera_pos;
