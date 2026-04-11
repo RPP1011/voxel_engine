@@ -158,6 +158,12 @@ pub struct LoadedChunkView {
 }
 
 /// Create a `w×h×d` R8_UINT 3D image for compute-write + sample + xfer.
+///
+/// The image is accessed by BOTH the compute queue (write during terrain
+/// materialize dispatch) AND the graphics queue (sample during render_frame_pool).
+/// If those are different queue families, we need `SharingMode::CONCURRENT` with
+/// both family indices, otherwise cross-queue reads hit undefined behaviour and
+/// produce visible artifacts (stale cache, wrong layout assumptions).
 fn create_3d_storage_image(
     ctx: &VulkanContext,
     alloc: &mut VulkanAllocator,
@@ -166,7 +172,28 @@ fn create_3d_storage_image(
     d: u32,
 ) -> Result<(vk::Image, vk::ImageView, Allocation)> {
     let device = ctx.device();
-    let image_ci = vk::ImageCreateInfo::default()
+
+    // Determine queue families that will access this image.
+    let compute_qf = ctx
+        .compute_queue()
+        .context("no compute queue")?
+        .family_index;
+    let graphics_qf = ctx
+        .graphics_queue()
+        .context("no graphics queue")?
+        .family_index;
+    let queue_families: Vec<u32> = if compute_qf == graphics_qf {
+        vec![] // EXCLUSIVE doesn't use this field
+    } else {
+        vec![compute_qf, graphics_qf]
+    };
+    let sharing_mode = if queue_families.is_empty() {
+        vk::SharingMode::EXCLUSIVE
+    } else {
+        vk::SharingMode::CONCURRENT
+    };
+
+    let mut image_ci = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_3D)
         .format(vk::Format::R8_UINT)
         .extent(vk::Extent3D {
@@ -184,8 +211,11 @@ fn create_3d_storage_image(
                 | vk::ImageUsageFlags::TRANSFER_DST
                 | vk::ImageUsageFlags::TRANSFER_SRC,
         )
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .sharing_mode(sharing_mode)
         .initial_layout(vk::ImageLayout::UNDEFINED);
+    if !queue_families.is_empty() {
+        image_ci = image_ci.queue_family_indices(&queue_families);
+    }
 
     let image = unsafe { device.create_image(&image_ci, None) }
         .context("create terrain storage image")?;
