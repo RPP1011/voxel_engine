@@ -26,6 +26,12 @@ pub struct GpuVoxelTexture {
     pub mip2_width: u32,
     pub mip2_height: u32,
     pub mip2_depth: u32,
+    pub mip3_image: vk::Image,
+    pub mip3_view: vk::ImageView,
+    mip3_allocation: Option<Allocation>,
+    pub mip3_width: u32,
+    pub mip3_height: u32,
+    pub mip3_depth: u32,
     /// 256x1 RGBA8 palette texture for per-voxel color lookup.
     pub palette_image: vk::Image,
     pub palette_view: vk::ImageView,
@@ -41,6 +47,8 @@ impl GpuVoxelTexture {
             ctx.device().destroy_image(self.mip1_image, None);
             ctx.device().destroy_image_view(self.mip2_view, None);
             ctx.device().destroy_image(self.mip2_image, None);
+            ctx.device().destroy_image_view(self.mip3_view, None);
+            ctx.device().destroy_image(self.mip3_image, None);
             ctx.device().destroy_image_view(self.palette_view, None);
             ctx.device().destroy_image(self.palette_image, None);
         }
@@ -51,6 +59,9 @@ impl GpuVoxelTexture {
             alloc.free_allocation(allocation);
         }
         if let Some(allocation) = self.mip2_allocation.take() {
+            alloc.free_allocation(allocation);
+        }
+        if let Some(allocation) = self.mip3_allocation.take() {
             alloc.free_allocation(allocation);
         }
         if let Some(allocation) = self.palette_allocation.take() {
@@ -354,56 +365,113 @@ fn upload_palette_data(
     Ok(())
 }
 
-/// Upload a VoxelGrid to a 3D R8_UINT VkImage, including MIP1, MIP2, and palette images.
+/// Upload a VoxelGrid to a 3D R8_UINT VkImage, including MIP1, MIP2, MIP3,
+/// and palette images.  All uploads are batched into a **single command buffer
+/// submission** (1 fence wait) instead of the previous 5 separate submissions.
+/// Mip levels are cascaded: MIP2 from MIP1, MIP3 from MIP2.
 pub fn upload_grid_to_gpu(
     ctx: &VulkanContext,
     alloc: &mut VulkanAllocator,
     grid: &VoxelGrid,
     palette_rgba: &[[u8; 4]; 256],
 ) -> Result<GpuVoxelTexture> {
+    let device = ctx.device();
+    let q = ctx.graphics_queue().context("No graphics queue")?;
     let (w, h, d) = grid.dimensions();
     let data = grid.data();
 
-    // Full-res image
-    let (image, image_view, allocation) = create_3d_r8_image(ctx, alloc, w, h, d)?;
-    upload_data_to_image(ctx, alloc, image, w, h, d, data)?;
-
-    // MIP1 (stride 2)
+    // --- CPU: generate cascaded mips (MIP2 from MIP1, MIP3 from MIP2) ---
     let (mip1_data, mip1_w, mip1_h, mip1_d) = generate_mip(data, w, h, d, 2);
-    let (mip1_image, mip1_view, mip1_alloc) = create_3d_r8_image(ctx, alloc, mip1_w, mip1_h, mip1_d)?;
-    upload_data_to_image(ctx, alloc, mip1_image, mip1_w, mip1_h, mip1_d, &mip1_data)?;
+    let (mip2_data, mip2_w, mip2_h, mip2_d) = generate_mip(&mip1_data, mip1_w, mip1_h, mip1_d, 2);
+    let (mip3_data, mip3_w, mip3_h, mip3_d) = generate_mip(&mip2_data, mip2_w, mip2_h, mip2_d, 2);
 
-    // MIP2 (stride 4)
-    let (mip2_data, mip2_w, mip2_h, mip2_d) = generate_mip(data, w, h, d, 4);
-    let (mip2_image, mip2_view, mip2_alloc) = create_3d_r8_image(ctx, alloc, mip2_w, mip2_h, mip2_d)?;
-    upload_data_to_image(ctx, alloc, mip2_image, mip2_w, mip2_h, mip2_d, &mip2_data)?;
+    // Palette as flat bytes
+    let palette_bytes: Vec<u8> = palette_rgba.iter().flat_map(|c| c.iter().copied()).collect();
 
-    // Palette (256x1 RGBA8)
-    let (palette_image, palette_view, palette_alloc) = create_palette_image(ctx, alloc)?;
-    upload_palette_data(ctx, alloc, palette_image, palette_rgba)?;
+    // --- GPU: create all images ---
+    let (image, image_view, img_alloc)       = create_3d_r8_image(ctx, alloc, w, h, d)?;
+    let (mip1_image, mip1_view, mip1_alloc)  = create_3d_r8_image(ctx, alloc, mip1_w, mip1_h, mip1_d)?;
+    let (mip2_image, mip2_view, mip2_alloc)  = create_3d_r8_image(ctx, alloc, mip2_w, mip2_h, mip2_d)?;
+    let (mip3_image, mip3_view, mip3_alloc)  = create_3d_r8_image(ctx, alloc, mip3_w, mip3_h, mip3_d)?;
+    let (pal_image, pal_view, pal_alloc)     = create_palette_image(ctx, alloc)?;
+
+    // --- CPU: pack all data into a single staging buffer ---
+    let total_size = data.len() + mip1_data.len() + mip2_data.len() + mip3_data.len() + palette_bytes.len();
+    let mut staging = alloc.allocate_host_visible_buffer(total_size as u64)?;
+    let off0 = 0u64;
+    let off1 = data.len() as u64;
+    let off2 = off1 + mip1_data.len() as u64;
+    let off3 = off2 + mip2_data.len() as u64;
+    let off_pal = off3 + mip3_data.len() as u64;
+    staging.write_data(off0 as usize, data)?;
+    staging.write_data(off1 as usize, &mip1_data)?;
+    staging.write_data(off2 as usize, &mip2_data)?;
+    staging.write_data(off3 as usize, &mip3_data)?;
+    staging.write_data(off_pal as usize, &palette_bytes)?;
+
+    // --- GPU: single command buffer for all transitions + copies ---
+    let cmd = one_time_cmd_begin(ctx, q.family_index)?;
+
+    // Transition all images to TRANSFER_DST
+    let images_3d = [
+        (image, w, h, d, off0),
+        (mip1_image, mip1_w, mip1_h, mip1_d, off1),
+        (mip2_image, mip2_w, mip2_h, mip2_d, off2),
+        (mip3_image, mip3_w, mip3_h, mip3_d, off3),
+    ];
+    for &(img, _, _, _, _) in &images_3d {
+        transition_image_layout(device, cmd, img,
+            vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+    }
+    transition_image_layout(device, cmd, pal_image,
+        vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+
+    // Copy from staging buffer to each image
+    let buf = staging.buffer();
+    for &(img, iw, ih, id, offset) in &images_3d {
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(offset)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0, base_array_layer: 0, layer_count: 1,
+            })
+            .image_extent(vk::Extent3D { width: iw, height: ih, depth: id });
+        unsafe { device.cmd_copy_buffer_to_image(cmd, buf, img,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]); }
+    }
+    // Palette copy
+    let pal_region = vk::BufferImageCopy::default()
+        .buffer_offset(off_pal)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0, base_array_layer: 0, layer_count: 1,
+        })
+        .image_extent(vk::Extent3D { width: 256, height: 1, depth: 1 });
+    unsafe { device.cmd_copy_buffer_to_image(cmd, buf, pal_image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[pal_region]); }
+
+    // Transition all images to SHADER_READ_ONLY
+    for &(img, _, _, _, _) in &images_3d {
+        transition_image_layout(device, cmd, img,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
+    transition_image_layout(device, cmd, pal_image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+    // Submit everything in one go
+    one_time_cmd_end(ctx, cmd, q)?;
+    alloc.free_buffer(staging);
 
     Ok(GpuVoxelTexture {
-        image,
-        image_view,
-        allocation: Some(allocation),
-        width: w,
-        height: h,
-        depth: d,
-        mip1_image,
-        mip1_view,
-        mip1_allocation: Some(mip1_alloc),
-        mip1_width: mip1_w,
-        mip1_height: mip1_h,
-        mip1_depth: mip1_d,
-        mip2_image,
-        mip2_view,
-        mip2_allocation: Some(mip2_alloc),
-        mip2_width: mip2_w,
-        mip2_height: mip2_h,
-        mip2_depth: mip2_d,
-        palette_image,
-        palette_view,
-        palette_allocation: Some(palette_alloc),
+        image, image_view, allocation: Some(img_alloc),
+        width: w, height: h, depth: d,
+        mip1_image, mip1_view, mip1_allocation: Some(mip1_alloc),
+        mip1_width: mip1_w, mip1_height: mip1_h, mip1_depth: mip1_d,
+        mip2_image, mip2_view, mip2_allocation: Some(mip2_alloc),
+        mip2_width: mip2_w, mip2_height: mip2_h, mip2_depth: mip2_d,
+        mip3_image, mip3_view, mip3_allocation: Some(mip3_alloc),
+        mip3_width: mip3_w, mip3_height: mip3_h, mip3_depth: mip3_d,
+        palette_image: pal_image, palette_view: pal_view, palette_allocation: Some(pal_alloc),
     })
 }
 

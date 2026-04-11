@@ -19,6 +19,11 @@ void main() {
     vec3 grid_pos = in_position * pc.grid_dim.xyz;
     frag_entry_pos = grid_pos;
     frag_camera_pos = pc.camera_pos.xyz;
-    // MVP already includes scale, so use unit position for clip space
-    gl_Position = pc.mvp * vec4(in_position, 1.0);
+
+    // Inflate by ~1 voxel to close rasterization gaps between adjacent
+    // cubes at low render resolution.  Back-face discard in the fragment
+    // shader prevents z-fighting from the overlap region.
+    float eps = 1.0 / max(pc.grid_dim.x, max(pc.grid_dim.y, pc.grid_dim.z));
+    vec3 inflated = mix(vec3(-eps), vec3(1.0 + eps), in_position);
+    gl_Position = pc.mvp * vec4(inflated, 1.0);
 }

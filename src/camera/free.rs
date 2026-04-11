@@ -30,6 +30,29 @@ impl FreeCamera {
         self.move_speed = speed;
     }
 
+    pub fn set_position(&mut self, position: Vec3) {
+        self.camera.position = position;
+        self.rebuild_camera();
+    }
+
+    // Renderer-compatible accessors (match OrbitCamera API)
+
+    pub fn eye_position(&self) -> [f32; 3] {
+        self.camera.position.into()
+    }
+
+    pub fn view_matrix_array(&self) -> [f32; 16] {
+        self.camera.view_matrix().to_cols_array()
+    }
+
+    pub fn projection_matrix_array(&self, aspect: f32) -> [f32; 16] {
+        self.camera.projection_matrix(aspect).to_cols_array()
+    }
+
+    pub fn center(&self) -> Vec3 {
+        self.camera.target
+    }
+
     fn forward(&self) -> Vec3 {
         Vec3::new(
             self.yaw.sin() * self.pitch.cos(),

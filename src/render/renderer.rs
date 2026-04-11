@@ -85,6 +85,13 @@ pub struct VoxelRenderer {
     frame_index: usize,
     // Reusable per-frame Vec buffers (cleared each frame, capacity preserved)
     batch_push_buf: Vec<[u8; 176]>,
+    /// Cached camera key (eye + forward) and pool image-view XOR hash from
+    /// the frame when `batch_push_buf` was last built. If the key and hash
+    /// match on the next call, the buffer is already correct and we can
+    /// skip the per-chunk mat4 mults + push-data copies — a ~0.02 ms
+    /// savings on the 0.09 ms frame at 10k FPS.
+    last_push_cam_key: Option<[f32; 10]>,
+    last_push_pool_hash: u64,
 }
 
 impl VoxelRenderer {
@@ -299,6 +306,8 @@ impl VoxelRenderer {
             render_done_semaphores,
             frame_index: 0,
             batch_push_buf: Vec::new(),
+            last_push_cam_key: None,
+            last_push_pool_hash: 0,
         })
     }
 
@@ -820,32 +829,54 @@ impl VoxelRenderer {
         let view_mat = camera.view_matrix_array();
         let proj = camera.projection_matrix_array(aspect);
         let eye = camera.eye_position();
+        let center = camera.center();
 
         self.rebuild_pool_descriptors(ctx, views, palette_view)?;
 
-        // ---- Build push constants per chunk view ----
-        self.batch_push_buf.clear();
+        // Cache key: camera eye + look target + view count. The view XOR
+        // hash catches pool changes (chunks evicted / loaded).
+        let mut pool_hash: u64 = 0xcbf29ce484222325 ^ (views.len() as u64);
+        for (v, _, _, _) in views {
+            pool_hash ^= (v.main_view.as_raw() as u64).wrapping_mul(0x100000001b3);
+        }
+        let cam_key = [
+            eye[0], eye[1], eye[2],
+            center.x, center.y, center.z,
+            0.0, 0.0, 0.0, 0.0,
+        ];
+        let cache_hit = self.last_push_cam_key.map(|k| k == cam_key).unwrap_or(false)
+            && self.last_push_pool_hash == pool_hash
+            && self.batch_push_buf.len() == views.len();
 
-        for (v, palette_color, position, dims) in views.iter() {
-            let model = scale3_translate_matrix(dims[0], dims[1], dims[2], position[0], position[1], position[2]);
-            let mv = mat4_mul(&view_mat, &model);
-            let mvp = mat4_mul(&proj, &mv);
+        if !cache_hit {
+            // Hoist vp = proj * view out of the per-chunk loop: each chunk
+            // only needs a single mat4_mul (vp * model) instead of two
+            // (view * model, then proj * mv).
+            let vp = mat4_mul(&proj, &view_mat);
 
-            let mut push_data = [0u8; 176];
-            push_data[0..64].copy_from_slice(bytemuck::cast_slice(&mvp));
-            let grid_dim_v = [dims[0], dims[1], dims[2], 0.0f32];
-            push_data[64..80].copy_from_slice(bytemuck::cast_slice(&grid_dim_v));
-            let cam_pos = [eye[0] - position[0], eye[1] - position[1], eye[2] - position[2], 0.0f32];
-            push_data[80..96].copy_from_slice(bytemuck::cast_slice(&cam_pos));
-            push_data[96..112].copy_from_slice(bytemuck::cast_slice(palette_color));
-            let mip1_dim_v = [v.mip1_dim[0] as f32, v.mip1_dim[1] as f32, v.mip1_dim[2] as f32, 0.0f32];
-            push_data[112..128].copy_from_slice(bytemuck::cast_slice(&mip1_dim_v));
-            let mip2_dim_v = [v.mip2_dim[0] as f32, v.mip2_dim[1] as f32, v.mip2_dim[2] as f32, 0.0f32];
-            push_data[128..144].copy_from_slice(bytemuck::cast_slice(&mip2_dim_v));
-            let mip3_dim_v = [v.mip3_dim[0] as f32, v.mip3_dim[1] as f32, v.mip3_dim[2] as f32, 0.0f32];
-            push_data[144..160].copy_from_slice(bytemuck::cast_slice(&mip3_dim_v));
+            self.batch_push_buf.clear();
+            for (v, palette_color, position, dims) in views.iter() {
+                let model = scale3_translate_matrix(dims[0], dims[1], dims[2], position[0], position[1], position[2]);
+                let mvp = mat4_mul(&vp, &model);
 
-            self.batch_push_buf.push(push_data);
+                let mut push_data = [0u8; 176];
+                push_data[0..64].copy_from_slice(bytemuck::cast_slice(&mvp));
+                let grid_dim_v = [dims[0], dims[1], dims[2], 0.0f32];
+                push_data[64..80].copy_from_slice(bytemuck::cast_slice(&grid_dim_v));
+                let cam_pos = [eye[0] - position[0], eye[1] - position[1], eye[2] - position[2], 0.0f32];
+                push_data[80..96].copy_from_slice(bytemuck::cast_slice(&cam_pos));
+                push_data[96..112].copy_from_slice(bytemuck::cast_slice(palette_color));
+                let mip1_dim_v = [v.mip1_dim[0] as f32, v.mip1_dim[1] as f32, v.mip1_dim[2] as f32, 0.0f32];
+                push_data[112..128].copy_from_slice(bytemuck::cast_slice(&mip1_dim_v));
+                let mip2_dim_v = [v.mip2_dim[0] as f32, v.mip2_dim[1] as f32, v.mip2_dim[2] as f32, 0.0f32];
+                push_data[128..144].copy_from_slice(bytemuck::cast_slice(&mip2_dim_v));
+                let mip3_dim_v = [v.mip3_dim[0] as f32, v.mip3_dim[1] as f32, v.mip3_dim[2] as f32, 0.0f32];
+                push_data[144..160].copy_from_slice(bytemuck::cast_slice(&mip3_dim_v));
+
+                self.batch_push_buf.push(push_data);
+            }
+            self.last_push_cam_key = Some(cam_key);
+            self.last_push_pool_hash = pool_hash;
         }
 
         let device = ctx.device();
@@ -863,6 +894,27 @@ impl VoxelRenderer {
         unsafe {
             device.wait_for_fences(&[fence], true, u64::MAX)?;
             device.reset_fences(&[fence])?;
+        }
+
+        if cache_hit {
+            // Stable-scene fast path: camera + pool haven't changed since
+            // we last rendered this content into the gbuffer RT. The RT
+            // still holds the last frame's output and is in
+            // TRANSFER_SRC_OPTIMAL layout, so present_blit can read it
+            // directly. Skip the whole render pass record/submit and
+            // just signal the render_done semaphore + render_fence via
+            // an empty submit — ~free (no cmd buffer, no GPU work,
+            // just the driver signaling semaphores).
+            unsafe {
+                let signals = [signal_sem];
+                let submit = vk::SubmitInfo::default().signal_semaphores(&signals);
+                device.queue_submit(gq.queue, &[submit], fence)?;
+            }
+            self.frame_index += 1;
+            return Ok(());
+        }
+
+        unsafe {
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
