@@ -63,10 +63,18 @@ fn compile_shaders(shader_dir: &Path, out_shader_dir: &Path) {
 
 /// Copy pre-compiled SPIR-V files from shaders/compiled/ to OUT_DIR/shaders/.
 /// Falls back to writing minimal SPIR-V stubs if shaders/compiled/ does not exist.
+///
+/// Fails the build if any shader source is newer than its committed SPV. The
+/// previous behaviour silently shipped stale SPIR-V whenever a developer
+/// edited a shader without remembering `--features compile-shaders`, which
+/// burned a multi-day debugging session chasing visual artifacts that came
+/// from running an old vertex shader. Failing fast with a clear message is
+/// the cheapest fix that keeps the precompiled-by-default story intact.
 fn copy_precompiled_shaders(shader_dir: &Path, out_shader_dir: &Path) {
     let compiled_dir = shader_dir.join("compiled");
 
     if compiled_dir.exists() {
+        check_spv_freshness(shader_dir, &compiled_dir);
         for entry in fs::read_dir(&compiled_dir)
             .expect("Failed to read shaders/compiled/ directory")
             .flatten()
@@ -89,6 +97,78 @@ fn copy_precompiled_shaders(shader_dir: &Path, out_shader_dir: &Path) {
         );
         stub_shaders(shader_dir, out_shader_dir);
     }
+}
+
+/// Panic if any GLSL source in `shader_dir` is newer than its corresponding
+/// `.spv` in `compiled_dir`. The error message tells the developer exactly
+/// how to refresh the SPV cache. See `copy_precompiled_shaders` for why this
+/// matters.
+fn check_spv_freshness(shader_dir: &Path, compiled_dir: &Path) {
+    let mut stale: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+
+    let entries = match fs::read_dir(shader_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str());
+        if !matches!(ext, Some("vert") | Some("frag") | Some("comp")) {
+            continue;
+        }
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if file_name.is_empty() {
+            continue;
+        }
+        let spv_path = compiled_dir.join(format!("{file_name}.spv"));
+
+        let src_mtime = match fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let spv_mtime = match fs::metadata(&spv_path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => {
+                missing.push(file_name.to_string());
+                continue;
+            }
+        };
+        if src_mtime > spv_mtime {
+            stale.push(file_name.to_string());
+        }
+    }
+
+    if stale.is_empty() && missing.is_empty() {
+        return;
+    }
+
+    let mut msg = String::from(
+        "\n\
+         Shader SPIR-V cache is out of date — running this build would ship\n\
+         stale precompiled shaders and silently mask your source-level edits.\n\
+         \n",
+    );
+    if !stale.is_empty() {
+        msg.push_str("  Source newer than shaders/compiled/*.spv:\n");
+        for f in &stale {
+            msg.push_str(&format!("    - {f}\n"));
+        }
+    }
+    if !missing.is_empty() {
+        msg.push_str("  Source files with no committed SPV:\n");
+        for f in &missing {
+            msg.push_str(&format!("    - {f}\n"));
+        }
+    }
+    msg.push_str(
+        "\n\
+         Refresh the SPV cache and commit the result:\n\
+           cargo build --features compile-shaders -p voxel_engine\n\
+           git add shaders/compiled/*.spv\n",
+    );
+    panic!("{msg}");
 }
 
 /// Write minimal valid SPIR-V headers as placeholder .spv files.
