@@ -280,6 +280,17 @@ pub struct TerrainComputePipeline {
     free_count: usize,
     in_flight_count: usize,
     loaded_count: usize,
+    /// Bulk-touch frame. When a caller knows that every currently Loaded
+    /// slot is still in the active render set but doesn't want to pay the
+    /// O(N) cost of calling `mark_touched_slot` per slot, it can call
+    /// [`Self::bulk_touch_all_loaded`] which just bumps this field in
+    /// O(1). The eviction LRU in `submit_chunk_with_frame` then reads
+    /// `effective_age = max(slot.last_touched_frame, bulk_touched_frame)`
+    /// for Loaded slots so they stay protected.
+    ///
+    /// On a cache-hit stable scene this replaces 256 scattered cache-line
+    /// writes per frame with one register update.
+    bulk_touched_frame: u64,
     // Region plan + rivers (shared across all slots; re-bound to every slot's
     // descriptor set whenever they are uploaded).
     region_cells_buffer: Option<AllocatedBuffer>,
@@ -770,6 +781,7 @@ impl TerrainComputePipeline {
             free_count: NUM_SLOTS,
             in_flight_count: 0,
             loaded_count: 0,
+            bulk_touched_frame: 0,
             region_cells_buffer: None,
             region_header_buffer: None,
             placeholder_cells_buffer,
@@ -1092,6 +1104,11 @@ impl TerrainComputePipeline {
         }
 
         // 2. Find a Free slot, or evict the least-recently-touched Loaded one.
+        //    Effective age for a Loaded slot is
+        //        max(slot.last_touched_frame, self.bulk_touched_frame)
+        //    so a single O(1) bulk_touch_all_loaded() call protects every
+        //    currently-loaded slot without a per-slot sweep.
+        let bulk_touched = self.bulk_touched_frame;
         let slot_idx = match self.slots.iter().position(|s| s.state == SlotState::Free) {
             Some(i) => i,
             None => {
@@ -1100,8 +1117,8 @@ impl TerrainComputePipeline {
                     .iter()
                     .enumerate()
                     .filter(|(_, s)| matches!(s.state, SlotState::Loaded(_)))
-                    .min_by_key(|(_, s)| s.last_touched_frame)
-                    .map(|(i, s)| (i, s.last_touched_frame));
+                    .map(|(i, s)| (i, s.last_touched_frame.max(bulk_touched)))
+                    .min_by_key(|(_, age)| *age);
                 match oldest {
                     Some((i, oldest_frame)) => {
                         // Refuse eviction if the LRU slot was touched this
@@ -1527,6 +1544,28 @@ impl TerrainComputePipeline {
             if matches!(s.state, SlotState::Loaded(_)) {
                 s.last_touched_frame = current_frame;
             }
+        }
+    }
+
+    /// Bulk-touch every currently Loaded slot at `current_frame` in O(1).
+    ///
+    /// Use this on a stable-scene fast path where the caller knows every
+    /// Loaded slot is still part of the active render set but doesn't
+    /// want to pay the O(N) cost of a per-slot mark_touched loop. The
+    /// LRU eviction check in `submit_chunk_with_frame` reads
+    /// `max(slot.last_touched_frame, bulk_touched_frame)` for Loaded
+    /// slots, so a single bulk-touch bump is equivalent to calling
+    /// mark_touched_slot on every loaded slot.
+    ///
+    /// When the caller's stable-scene condition ends (e.g. camera moves)
+    /// it should STOP calling this — future frames' full-cull path will
+    /// rewrite individual slots' `last_touched_frame`, letting slots
+    /// that genuinely fell out of the visible set age out normally.
+    pub fn bulk_touch_all_loaded(&mut self, current_frame: u64) {
+        // Monotonic: never move backwards, guards against callers that
+        // cycle through frame counters or call out of order.
+        if current_frame > self.bulk_touched_frame {
+            self.bulk_touched_frame = current_frame;
         }
     }
 
