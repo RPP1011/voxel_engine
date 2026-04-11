@@ -605,13 +605,13 @@ uvec2 seed_plus_salt(uint seed, uvec2 salt) {
 }
 
 // Maximum footprint radii (must conservatively bound the largest shape).
-// Tree canopy: 20 + 10 = 30 max radius (large trees). dx²+dy² up to 900.
-// Also the canopy extends up to 30 above trunk top. Trunk top can be at
-// base_z + 120. So max vertical extent above surface ≈ 150.
-// Boulder: up to size=10 (forward AABB). Pillar: radius up to 5, height up to 60.
-const int FEATURE_MAX_RADIUS_SQ = 900; // 30²
-const int FEATURE_MAX_Z_ABOVE   = 160; // head-room above surface
-const int FEATURE_MAX_Z_BELOW   = 5;   // features clipped to surface; trunk base = surface+1
+// Procedural trees: crown_radius_xy up to 30 + leaf_radius ~10.5 + slack ≈ 44
+// max horizontal reach from origin. dx²+dy² up to ~44² = 1936.
+// Vertical: trunk up to 120 + crown_height up to ~80 + leaf_radius ~10 ≈ 220.
+// Droopy willows extend ~44 below the base.
+const int FEATURE_MAX_RADIUS_SQ = 2025; // 45²
+const int FEATURE_MAX_Z_ABOVE   = 220;  // head-room above surface
+const int FEATURE_MAX_Z_BELOW   = 45;   // droopy crown can extend below base
 
 struct FeatureParams {
     float tree_density;
@@ -667,60 +667,198 @@ FeatureParams feature_params(uint terrain, uint sub_biome) {
     return p;
 }
 
+// ---------- Procedural tree parameters (mirrors Rust features.rs) ----------
+
+const uint SHAPE_ELLIPSOID = 0u;
+const uint SHAPE_CONE      = 1u;
+const uint SHAPE_FLAT_WIDE = 2u;
+const uint SHAPE_DROOPY    = 3u;
+
+struct TreeParams {
+    int   trunk_height;
+    float trunk_radius;
+    int   crown_base_z;
+    int   crown_height;
+    float crown_radius_xy;
+    float crown_radius_z;
+    uint  crown_shape;
+    uint  num_attractors;
+    uint  num_clusters;
+    float branch_radius;
+    float leaf_radius;
+    uint  canopy_material;
+};
+
+// Mirrors Rust tree_params_for_biome. Uses u64 hash path with TREE_HEIGHT_SALT.
+TreeParams tree_params_for_biome(uint terrain, int ox, int oy, uint seed) {
+    uvec2 s = seed_plus_salt(seed, SALT_TREE_HEIGHT);
+    float size_hash = hash_f32_u64_full(ox, oy, 5, s);
+    float h_hash    = hash_f32_u64_full(ox, oy, 0, s);
+
+    int   trunk_height;
+    float trunk_radius;
+    float crown_radius_xy;
+    if (size_hash < 0.2) {
+        trunk_height    = 10 + int(h_hash * 10.0);
+        trunk_radius    = 1.0;
+        crown_radius_xy = 5.0 + h_hash * 3.0;
+    } else if (size_hash > 0.8) {
+        trunk_height    = 80 + int(h_hash * 40.0);
+        trunk_radius    = 2.0 + h_hash;
+        crown_radius_xy = 20.0 + h_hash * 10.0;
+    } else {
+        trunk_height    = 40 + int(h_hash * 30.0);
+        trunk_radius    = 1.0 + h_hash * 1.5;
+        crown_radius_xy = 12.0 + h_hash * 6.0;
+    }
+
+    uint  crown_shape;
+    uint  num_attractors;
+    uint  num_clusters;
+    float crown_stretch_z;
+    if (terrain == 6u) {        // Tundra
+        crown_shape = SHAPE_CONE;      num_attractors = 10u; num_clusters = 4u; crown_stretch_z = 1.3;
+    } else if (terrain == 0u) { // Plains
+        crown_shape = SHAPE_FLAT_WIDE; num_attractors = 12u; num_clusters = 4u; crown_stretch_z = 0.5;
+    } else if (terrain == 9u) { // Jungle
+        crown_shape = SHAPE_CONE;      num_attractors = 20u; num_clusters = 6u; crown_stretch_z = 1.2;
+    } else if (terrain == 4u) { // Swamp
+        crown_shape = SHAPE_DROOPY;    num_attractors = 14u; num_clusters = 5u; crown_stretch_z = 1.0;
+    } else {                    // Forest default
+        crown_shape = SHAPE_ELLIPSOID; num_attractors = 16u; num_clusters = 5u; crown_stretch_z = 0.9;
+    }
+
+    TreeParams tp;
+    tp.trunk_height    = trunk_height;
+    tp.trunk_radius    = trunk_radius;
+    tp.crown_base_z    = int(float(trunk_height) * 0.55);
+    tp.crown_height    = int(crown_radius_xy * 2.0 * crown_stretch_z);
+    tp.crown_radius_xy = crown_radius_xy;
+    tp.crown_radius_z  = crown_radius_xy * crown_stretch_z;
+    tp.crown_shape     = crown_shape;
+    tp.num_attractors  = num_attractors;
+    tp.num_clusters    = num_clusters;
+    tp.branch_radius   = max(trunk_radius * 0.4, 0.7);
+    tp.leaf_radius     = max(crown_radius_xy * 0.35, 1.5);
+    tp.canopy_material = (terrain == 9u) ? 37u /*JungleMoss*/ : 42u /*Leaves*/;
+    return tp;
+}
+
+// Mirrors Rust attractor(). Uses seed.wrapping_add(0xA77A) as the u64 base.
+// 0xA77A fits in the low 32 bits; the salt has hi=0.
+const uvec2 SALT_TREE_ATTR = uvec2(0x00000000u, 0x0000A77Au);
+
+vec3 tree_attractor(uint i, int ox, int oy, uint seed, TreeParams tp) {
+    uvec2 s = seed_plus_salt(seed, SALT_TREE_ATTR);
+    int iz1 = int(i) * 7 + 1;
+    int iz2 = int(i) * 7 + 2;
+    int iz3 = int(i) * 7 + 3;
+    float h1 = hash_f32_u64_full(ox, oy, iz1, s);
+    float h2 = hash_f32_u64_full(ox, oy, iz2, s);
+    float h3 = hash_f32_u64_full(ox, oy, iz3, s);
+
+    float angle = h1 * 2.0 * 3.14159265358979323846;
+    float t_z = h3;
+
+    float radius_factor;
+    if (tp.crown_shape == SHAPE_ELLIPSOID || tp.crown_shape == SHAPE_FLAT_WIDE) {
+        float z_norm = 2.0 * t_z - 1.0;
+        radius_factor = sqrt(max(1.0 - z_norm * z_norm, 0.0));
+    } else if (tp.crown_shape == SHAPE_CONE) {
+        radius_factor = 1.0 - t_z;
+    } else { // SHAPE_DROOPY
+        radius_factor = (t_z < 0.3) ? 1.0 : (1.0 - (t_z - 0.3) / 0.7);
+    }
+
+    float radius = sqrt(h2) * tp.crown_radius_xy * radius_factor;
+    float dx = cos(angle) * radius;
+    float dy = sin(angle) * radius;
+
+    float dz;
+    if (tp.crown_shape == SHAPE_DROOPY) {
+        dz = float(tp.crown_base_z) + (t_z - 0.3) * float(tp.crown_height);
+    } else {
+        dz = float(tp.crown_base_z) + t_z * float(tp.crown_height);
+    }
+    return vec3(dx, dy, dz);
+}
+
+// Capsule SDF (signed distance). Negative inside.
+float capsule_sdf(vec3 p, vec3 a, vec3 b, float r) {
+    vec3 ab = b - a;
+    vec3 ap = p - a;
+    float ab2 = dot(ab, ab);
+    float t = (ab2 > 1e-6) ? clamp(dot(ap, ab) / ab2, 0.0, 1.0) : 0.0;
+    vec3 c = a + ab * t - p;
+    return length(c) - r;
+}
+
+float sphere_sdf(vec3 p, vec3 c, float r) {
+    return length(p - c) - r;
+}
+
 // Try to place a tree at origin (ox,oy) and test whether it covers (vx,vy,vz).
 // Returns the override material or 0xFFFFFFFFu if not covered.
-// `is_trunk` out-param flags whether the covered voxel is a trunk voxel (used
-// by canopy to skip overwriting the trunk — matches Rust).
+// `covered_by_trunk` out-param flags whether the covered voxel is a trunk or
+// branch voxel (used by leaves to skip overwriting the trunk).
 uint try_tree_at(int ox, int oy, int vx, int vy, int vz, int feature_base_z,
-                 uint seed, FeatureParams fp, out bool covered_by_trunk) {
+                 uint seed, FeatureParams fp, uint terrain, out bool covered_by_trunk) {
     covered_by_trunk = false;
 
-    // Density check.
+    // Density check — same path as before.
     float td = hash_f32_u64_full(ox, oy, 0, seed_plus_salt(seed, SALT_TREE_DENSITY));
-    // Cluster noise (u32 fbm_2d path — uses u32 seed directly).
     float cluster = fbm_2d(float(ox) * 0.025, float(oy) * 0.025,
                            seed + 0xC1C1u, 2, 2.0, 0.5);
     float effective_density = fp.tree_density * (0.3 + cluster * 1.4);
     if (td >= effective_density) return 0xFFFFFFFFu;
 
-    // Size (matches Rust stamp_tree_biome).
-    float size_hash = hash_f32_u64_full(ox, oy, 5, seed_plus_salt(seed, SALT_TREE_HEIGHT));
-    float h_hash    = hash_f32_u64_full(ox, oy, 0, seed_plus_salt(seed, SALT_TREE_HEIGHT));
+    TreeParams tp = tree_params_for_biome(terrain, ox, oy, seed);
 
-    int trunk_height;
-    int trunk_radius;
-    int canopy_r;
-    if (size_hash < 0.2) {
-        trunk_height = 10 + int(h_hash * 10.0);
-        trunk_radius = 1;
-        canopy_r     = 5 + int(h_hash * 3.0);
-    } else if (size_hash > 0.8) {
-        trunk_height = 80 + int(h_hash * 40.0);
-        trunk_radius = 2;
-        canopy_r     = 20 + int(h_hash * 10.0);
-    } else {
-        trunk_height = 40 + int(h_hash * 30.0);
-        trunk_radius = 1 + int(h_hash * 1.5);
-        canopy_r     = 12 + int(h_hash * 6.0);
+    vec3 p = vec3(float(vx), float(vy), float(vz));
+    vec3 origin_base = vec3(float(ox), float(oy), float(feature_base_z));
+
+    // Trunk capsule.
+    vec3 trunk_a = origin_base;
+    vec3 trunk_b = origin_base + vec3(0.0, 0.0, float(tp.trunk_height));
+    float trunk_d = capsule_sdf(p, trunk_a, trunk_b, tp.trunk_radius);
+    if (trunk_d <= 0.0) {
+        covered_by_trunk = true;
+        return MAT_WOOD_LOG;
     }
 
-    int dx = vx - ox;
-    int dy = vy - oy;
-
-    // Trunk (cylinder from feature_base_z up trunk_height).
-    int dz_trunk = vz - feature_base_z;
-    if (dz_trunk >= 0 && dz_trunk < trunk_height) {
-        int r2 = trunk_radius * trunk_radius + 1;
-        if (dx * dx + dy * dy <= r2) {
-            covered_by_trunk = true;
-            return MAT_WOOD_LOG;
+    // Compute cluster centroids and branch capsules.
+    // Each attractor is assigned to cluster (i % num_clusters). We stream
+    // through attractors twice: once to compute centroids, once to test
+    // leaf spheres. This matches the Rust reference implementation.
+    float min_branch = 1e9;
+    for (uint ci = 0u; ci < tp.num_clusters; ci++) {
+        vec3 sum = vec3(0.0);
+        uint cnt = 0u;
+        for (uint j = 0u; j < tp.num_attractors; j++) {
+            if ((j % tp.num_clusters) != ci) continue;
+            sum += tree_attractor(j, ox, oy, seed, tp);
+            cnt++;
         }
+        vec3 ctd = (cnt > 0u) ? (sum / float(cnt)) : vec3(0.0);
+
+        float t_along = (float(ci) / float(tp.num_clusters)) * 0.4 + 0.55;
+        vec3 branch_a = origin_base + vec3(0.0, 0.0, float(tp.trunk_height) * t_along);
+        vec3 branch_b = origin_base + ctd;
+        float d = capsule_sdf(p, branch_a, branch_b, tp.branch_radius);
+        if (d < min_branch) min_branch = d;
+    }
+    if (min_branch <= 0.0) {
+        covered_by_trunk = true;
+        return MAT_WOOD_LOG;
     }
 
-    // Canopy sphere centered at feature_base_z + trunk_height.
-    int cdz = vz - (feature_base_z + trunk_height);
-    if (dx * dx + dy * dy + cdz * cdz <= canopy_r * canopy_r) {
-        return fp.canopy_material;
+    // Leaf spheres.
+    for (uint i = 0u; i < tp.num_attractors; i++) {
+        vec3 attr = tree_attractor(i, ox, oy, seed, tp);
+        vec3 leaf_c = origin_base + attr;
+        if (sphere_sdf(p, leaf_c, tp.leaf_radius) <= 0.0) {
+            return tp.canopy_material;
+        }
     }
 
     return 0xFFFFFFFFu;
@@ -787,7 +925,7 @@ uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
     // into this chunk.
     int vlx = vx - base_x;
     int vly = vy - base_y;
-    int rmax = 30; // max tree canopy radius
+    int rmax = 45; // max procedural tree horizontal reach
     int olx_min = vlx - rmax;
     int olx_max = vlx + rmax;
     int oly_min = vly - rmax;
@@ -824,7 +962,7 @@ uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
             // Trees first (CPU order).
             if (fp.tree_density > 0.0) {
                 bool trunk_hit;
-                uint tm = try_tree_at(ox, oy, vx, vy, vz, feature_base_z, seed, fp, trunk_hit);
+                uint tm = try_tree_at(ox, oy, vx, vy, vz, feature_base_z, seed, fp, origin_cell.terrain, trunk_hit);
                 if (tm != 0xFFFFFFFFu) {
                     // CPU canopy rule: canopy does NOT overwrite trunk voxels.
                     // On GPU, if a previous iteration marked us as a trunk and
