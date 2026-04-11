@@ -25,8 +25,25 @@ const MIP2_SIZE: u32 = CHUNK_SIZE / 4;
 const MIP3_SIZE: u32 = CHUNK_SIZE / 8;
 
 /// Number of chunk texture pool slots. 64³ R8_UINT main + 32³ + 16³ + 8³ mips
-/// ≈ 300KB each × 256 = ~75MB of GPU memory dedicated to the pool.
-const NUM_SLOTS: usize = 256;
+/// ≈ 300KB each × 1024 = ~300MB of GPU memory dedicated to the pool.
+///
+/// Why 1024: a rotating first-person camera at surface level needs
+/// roughly 4× the instantaneous visible count of chunks resident to
+/// hold a full 360° rotation (4 orientations × ~60-80 visible per
+/// orientation with a 90° horizontal FOV ≈ 250-320 chunks). The old
+/// 256 was *just under* that threshold, so a rotation triggered
+/// constant 1:1 eviction churn — chunks off-screen were evicted, and
+/// when the camera rotated back they had to re-compute from scratch,
+/// which the user saw as pop-in. 1024 gives ~3× headroom over the
+/// minimum so camera motion in any direction stays fully cached.
+///
+/// 300MB is comfortable for any discrete GPU; for an 8GB card it's
+/// <4% of VRAM. If integrated GPUs show up later we can make this a
+/// runtime config.
+///
+/// Must match `POOL_SLOT_COUNT` in `render/renderer.rs` — the
+/// descriptor pool sized for visible-chunk sampling descriptors.
+const NUM_SLOTS: usize = 1024;
 
 /// Key used to identify a chunk in the pool — voxel chunk coordinates.
 pub type ChunkKey = [i32; 3];

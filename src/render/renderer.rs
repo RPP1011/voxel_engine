@@ -711,14 +711,15 @@ impl VoxelRenderer {
     /// Populate the per-visible-chunk descriptor set list for the pool
     /// render path using a persistent cache keyed by main image view.
     ///
-    /// The terrain compute pool holds at most 256 slots and each slot owns
-    /// a stable set of image views (main + 3 mip levels) for the lifetime
-    /// of the renderer. We lazily allocate and write one descriptor set
-    /// per unique main_view the first time we see it, then reuse it on
-    /// every subsequent frame. The previous implementation destroyed and
-    /// rebuilt the entire pool every time the visible set changed — which
-    /// was every frame during pool fill-up, costing up to ~2ms of raycast
-    /// latency spikes from allocating 100+ descriptor sets at once.
+    /// The terrain compute pool holds at most 1024 slots and each slot
+    /// owns a stable set of image views (main + 3 mip levels) for the
+    /// lifetime of the renderer. We lazily allocate and write one
+    /// descriptor set per unique main_view the first time we see it,
+    /// then reuse it on every subsequent frame. The previous
+    /// implementation destroyed and rebuilt the entire pool every time
+    /// the visible set changed — which was every frame during pool
+    /// fill-up, costing up to ~2ms of raycast latency spikes from
+    /// allocating 100+ descriptor sets at once.
     fn rebuild_pool_descriptors(
         &mut self,
         ctx: &VulkanContext,
@@ -728,9 +729,11 @@ impl VoxelRenderer {
         let device = ctx.device();
 
         // One-time pool creation: size generously for the full pool slot
-        // count (256) × 5 bindings each. Allocations are reused forever.
+        // count × 5 bindings each. Allocations are reused forever.
+        // MUST match `NUM_SLOTS` in terrain_compute.rs — that constant
+        // bounds how many unique main_view handles we can ever see.
         if self.obj_desc_pool.is_none() {
-            const POOL_SLOT_COUNT: u32 = 256;
+            const POOL_SLOT_COUNT: u32 = 1024;
             const BINDINGS_PER_SET: u32 = 5;
             let ps = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
