@@ -80,11 +80,18 @@ impl SwapchainContext {
             .unwrap_or(&formats[0])
             .clone();
 
+        // Prefer MAILBOX (triple-buffered, no tearing, no vsync wait) →
+        // IMMEDIATE (no vsync, may tear, lowest latency) → FIFO (vsync, 60Hz cap).
+        // For perf measurement we want MAILBOX/IMMEDIATE so the frame loop
+        // isn't capped at the display refresh rate.
         let present_mode = if present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
             vk::PresentModeKHR::MAILBOX
+        } else if present_modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+            vk::PresentModeKHR::IMMEDIATE
         } else {
             vk::PresentModeKHR::FIFO // always available
         };
+        eprintln!("[voxel] Swapchain present mode: {:?} (available: {:?})", present_mode, present_modes);
 
         let size = window.inner_size();
         let extent = vk::Extent2D {
