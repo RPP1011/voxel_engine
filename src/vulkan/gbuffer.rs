@@ -4,15 +4,17 @@ use ash::vk;
 use super::graphics_pipeline::GraphicsPipeline;
 use super::instance::VulkanContext;
 
-/// G-buffer with 3 color attachments + depth.
-/// (Previously 5 — velocity and linear-depth RTs were written per frame but
-/// never sampled by any downstream pass, so they were pure ROP overhead.)
+/// Single-pass "forward" gbuffer with 1 color attachment + depth.
+/// The gbuffer frag shader now writes the final lit color directly, so the
+/// old fullscreen deferred sun pass is gone. Previously we had 3 RTs
+/// (albedo/normal/material) → sampled by deferred_sun.frag → written to a
+/// separate light_target. Now: 1 RT with final color, no light pass.
 pub struct GBuffer {
     pub width: u32,
     pub height: u32,
     pub render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
-    // RT0: Albedo RGBA8, RT1: Normal RGBA16F, RT2: Material RGBA8
+    // RT0: final lit color RGBA8 (sampled by present_blit)
     rt_images: Vec<vk::Image>,
     rt_memories: Vec<vk::DeviceMemory>,
     rt_views: Vec<vk::ImageView>,
@@ -31,10 +33,8 @@ struct RtSpec {
     format: vk::Format,
 }
 
-const RT_SPECS: [RtSpec; 3] = [
-    RtSpec { format: vk::Format::R8G8B8A8_UNORM },     // albedo
-    RtSpec { format: vk::Format::R16G16B16A16_SFLOAT },// normal
-    RtSpec { format: vk::Format::R8G8B8A8_UNORM },     // material
+const RT_SPECS: [RtSpec; 1] = [
+    RtSpec { format: vk::Format::R8G8B8A8_UNORM }, // final lit color
 ];
 
 impl GBuffer {
@@ -52,10 +52,13 @@ impl GBuffer {
                     .load_op(vk::AttachmentLoadOp::CLEAR)
                     .store_op(vk::AttachmentStoreOp::STORE)
                     .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                    // The color RT is read by present_blit as a blit source
+                    // immediately after render — put it in TRANSFER_SRC_OPTIMAL
+                    // at render-pass end so we don't need a follow-up barrier.
+                    .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
             );
         }
-        // Depth attachment (index 3)
+        // Depth attachment (index 1)
         attachments.push(
             vk::AttachmentDescription::default()
                 .format(vk::Format::D32_SFLOAT)
@@ -66,14 +69,14 @@ impl GBuffer {
                 .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
         );
 
-        let color_refs: Vec<vk::AttachmentReference> = (0..3)
+        let color_refs: Vec<vk::AttachmentReference> = (0..1)
             .map(|i| vk::AttachmentReference {
                 attachment: i,
                 layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             })
             .collect();
         let depth_ref = vk::AttachmentReference {
-            attachment: 3,
+            attachment: 1,
             layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         };
 
@@ -83,19 +86,16 @@ impl GBuffer {
             .depth_stencil_attachment(&depth_ref);
 
         let subpasses = [subpass];
-        // Explicit subpass→EXTERNAL dependency so the deferred light pass
-        // that samples these RTs sees a consistent result without needing a
-        // separate vkCmdPipelineBarrier after vkCmdEndRenderPass. The
-        // default subpass dependency is a weak TOP_OF_PIPE → BOTTOM_OF_PIPE
-        // with no access masks — it doesn't guarantee the color-attachment
-        // writes are visible to a fragment-shader read. This one does.
+        // Explicit subpass→EXTERNAL dependency so the subsequent present_blit
+        // reads a consistent result. dst is TRANSFER (present_blit does a
+        // vkCmdBlitImage from this RT to the swapchain image).
         let dependencies = [vk::SubpassDependency::default()
             .src_subpass(0)
             .dst_subpass(vk::SUBPASS_EXTERNAL)
             .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
             .dependency_flags(vk::DependencyFlags::BY_REGION)];
         let rp_ci = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
@@ -170,9 +170,14 @@ impl GBuffer {
         })
     }
 
-    /// Get image view for a specific RT (0=albedo, 1=normal, 2=material, 3=velocity, 4=depth).
+    /// Get image view for a specific RT. Currently only RT0 (final lit color).
     pub fn rt_view(&self, index: usize) -> vk::ImageView {
         self.rt_views[index]
+    }
+
+    /// Get image handle for a specific RT. Used by present_blit as source.
+    pub fn rt_image(&self, index: usize) -> vk::Image {
+        self.rt_images[index]
     }
 
     /// Shared unit cube vertex buffer (8 verts, [0,1]^3).
@@ -230,9 +235,7 @@ impl GBuffer {
         objects: &[(&[u8], vk::DescriptorSet)],
     ) {
         let clear_values = [
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // albedo
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // normal
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // material
+            vk::ClearValue { color: vk::ClearColorValue { float32: [0.1, 0.1, 0.15, 1.0] } }, // sky clear color
             vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
         ];
 
@@ -296,9 +299,7 @@ impl GBuffer {
         let cmd = unsafe { device.allocate_command_buffers(&alloc_ci) }?[0];
 
         let clear_values = [
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // albedo
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // normal
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // material
+            vk::ClearValue { color: vk::ClearColorValue { float32: [0.1, 0.1, 0.15, 1.0] } }, // sky clear color
             vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
         ];
 
@@ -375,9 +376,7 @@ impl GBuffer {
         let cmd = unsafe { device.allocate_command_buffers(&alloc_ci) }?[0];
 
         let clear_values = [
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // albedo
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // normal
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }, // material
+            vk::ClearValue { color: vk::ClearColorValue { float32: [0.1, 0.1, 0.15, 1.0] } }, // sky clear color
             vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
         ];
 

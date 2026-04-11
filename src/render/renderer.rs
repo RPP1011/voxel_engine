@@ -118,7 +118,7 @@ impl VoxelRenderer {
             .descriptor(2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, vk::ShaderStageFlags::FRAGMENT)
             .descriptor(3, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, vk::ShaderStageFlags::FRAGMENT)
             .descriptor(4, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, vk::ShaderStageFlags::FRAGMENT)
-            .color_attachment_count(3)
+            .color_attachment_count(1)
             .cull_mode(vk::CullModeFlags::NONE) // no HW culling; back faces discarded in frag shader
             .build()?;
 
@@ -235,20 +235,17 @@ impl VoxelRenderer {
             device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
         }?;
 
-        // Write light descriptor set once — GBuffer RT views never change
+        // NOTE: the light pass has been merged into gbuffer.frag and is no
+        // longer called. We still allocate light_desc_set for API compat
+        // but we write it to point at the (single) gbuffer RT0 three times
+        // — the light pipeline is never bound so the contents don't matter,
+        // but Vulkan validation requires the set be initialized.
         let light_img_infos = [
             vk::DescriptorImageInfo::default()
                 .sampler(sampler)
-                .image_view(gbuffer.rt_view(0)) // albedo
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            vk::DescriptorImageInfo::default()
-                .sampler(sampler)
-                .image_view(gbuffer.rt_view(1)) // normal
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            vk::DescriptorImageInfo::default()
-                .sampler(sampler)
-                .image_view(gbuffer.rt_view(2)) // material
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                .image_view(gbuffer.rt_view(0))
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            3
         ];
         let light_writes: Vec<vk::WriteDescriptorSet> = (0..3)
             .map(|i| {
@@ -551,6 +548,13 @@ impl VoxelRenderer {
     /// Return the light target's color image handle (for GPU-only blit presentation).
     pub fn light_output_image(&self) -> vk::Image {
         self.light_target.color_image()
+    }
+
+    /// Return the gbuffer's final color RT image (for GPU-only blit
+    /// presentation). After the light-pass merge this is the post-light
+    /// output and is in TRANSFER_SRC_OPTIMAL layout after `render_frame_pool`.
+    pub fn gbuffer_output_image(&self) -> vk::Image {
+        self.gbuffer.rt_image(0)
     }
 
     /// Render all passes on the GPU without reading back pixels.
@@ -875,45 +879,16 @@ impl VoxelRenderer {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         }
 
-        // Pass 1: GBuffer
+        // Single "forward" pass: gbuffer.frag now writes the final lit
+        // color directly into a single color attachment. The former
+        // deferred-light fullscreen pass has been removed — lighting is
+        // inlined in the fragment shader (see gbuffer.frag). Also removed:
+        // the dead shadow pass (nothing sampled it) and a redundant
+        // record_transition_for_sampling call (the render pass's
+        // final_layout + subpass dependency handle the transition).
         self.gbuffer.record_batch(device, cmd, &self.gbuffer_pipeline, &batch_objects);
-
-        // NOTE: There used to be a shadow-map pass here. It rendered one
-        // chunk cube per frame into a depth-only render target, but no
-        // downstream shader ever sampled that depth map — the deferred
-        // light shader only reads albedo/normal/material. The pass was
-        // pure dead work (another 480×270 raymarching draw) and has been
-        // removed. The shadow_map field is still allocated (for API
-        // compatibility) but no longer drawn into.
-
-        // NOTE: previously there was a `record_transition_for_sampling` call
-        // here that issued three vkCmdPipelineBarrier calls to move the
-        // gbuffer RTs from TRANSFER_SRC_OPTIMAL to SHADER_READ_ONLY_OPTIMAL.
-        // It was both *redundant* (the render pass's final_layout already
-        // transitions the attachments to SHADER_READ_ONLY_OPTIMAL at end)
-        // and *incorrect* (old_layout didn't match the actual layout). Each
-        // extraneous barrier causes a cache flush / pipeline drain; on this
-        // GPU that was a non-trivial chunk of the wait bucket. Removed.
-
-        // Pass 4: Deferred sun light pass
-        let sun_dir = normalize_v([0.5, 0.8, 0.3]);
-        let center = camera.center();
-        let view_dir = normalize_v([
-            center.x - eye[0],
-            center.y - eye[1],
-            center.z - eye[2],
-        ]);
-        let mut light_push = [0u8; 48];
-        let sun_dir_v = [sun_dir[0], sun_dir[1], sun_dir[2], 2.0f32];
-        let sun_color_v = [1.0f32, 0.95, 0.9, 1.0];
-        let cam_dir_v = [view_dir[0], view_dir[1], view_dir[2], 0.0f32];
-        light_push[0..16].copy_from_slice(bytemuck::cast_slice(&sun_dir_v));
-        light_push[16..32].copy_from_slice(bytemuck::cast_slice(&sun_color_v));
-        light_push[32..48].copy_from_slice(bytemuck::cast_slice(&cam_dir_v));
-
-        self.light_target.record_draw_fullscreen(
-            device, cmd, &self.light_pipeline, &light_push, self.light_desc_set,
-        );
+        let _ = eye; // unused now that lighting is in-shader
+        let _ = camera;
 
         unsafe {
             device.end_command_buffer(cmd)?;

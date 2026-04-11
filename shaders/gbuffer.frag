@@ -5,18 +5,16 @@
 // occluded fragment still runs the full DDA raymarch before being
 // thrown away. With early_fragment_tests + front-to-back draw order,
 // back chunks that are occluded by front chunks skip the DDA entirely.
-// Safe here because depth is purely rasterizer-interpolated
-// (gl_Position.z from the vertex shader) — we never write gl_FragDepth.
 layout(early_fragment_tests) in;
 
 layout(location = 0) in vec3 frag_entry_pos;
 layout(location = 1) flat in vec3 frag_camera_pos;
 
-layout(location = 0) out vec4 out_albedo;     // RT0: RGBA8
-layout(location = 1) out vec4 out_normal;      // RT1: RGB16F (xyz = world normal)
-layout(location = 2) out vec4 out_material;    // RT2: RGBA8 (roughness, metallic, emissive, material_type)
-// Former RT3 (velocity) and RT4 (linear depth) removed — neither was read
-// by any downstream pass, and the ROP writes cost real per-fragment time.
+// Single color RT now holds the FINAL LIT COLOR. Previously this was a
+// 3-RT deferred gbuffer (albedo/normal/material) fed into a separate
+// fullscreen sun-light pass; that pass is gone and lighting is inlined
+// here. Saves 2 ROP writes per fragment + an entire fullscreen draw.
+layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform usampler3D voxel_grid;
 layout(set = 0, binding = 1) uniform usampler3D mip1_grid;
@@ -107,10 +105,7 @@ void main() {
         if (pos.x < 0 || pos.y < 0 || pos.z < 0 ||
             pos.x >= int(dim.x) || pos.y >= int(dim.y) || pos.z >= int(dim.z)) {
             if (any_debug) {
-                vec3 sun_n = normalize(vec3(0.5, 0.8, 0.3));
-                out_albedo = vec4(0.25, 0.25, 0.25, 1.0);
-                out_normal = vec4(sun_n * 0.5 + 0.5, 0.0);
-                out_material = vec4(0.0);
+                out_color = vec4(0.25, 0.25, 0.25, 1.0);
                 gl_FragDepth = 0.9999;
                 return;
             }
@@ -170,9 +165,44 @@ void main() {
                 vec4 pal = texelFetch(palette_tex, ivec2(voxel, 0), 0);
                 final_color = pal.rgb;
             }
-            out_albedo = vec4(final_color, 1.0);
-            out_normal = vec4(normal * 0.5 + 0.5, 0.0); // encode [-1,1] → [0,1]
-            out_material = vec4(pc.palette_color.a, 0.0, 0.0, float(voxel) / 255.0);
+            // Inline sun-light shading (previously a separate fullscreen
+            // deferred pass that sampled a 3-RT gbuffer — see commit msg).
+            // For debug visualizations we bypass lighting and emit the raw
+            // palette color. Debug-mode branches above already replaced
+            // `final_color` with a debug swatch AND set `normal` to the sun
+            // direction, so the diffuse term is effectively unity — fine.
+            vec3 lit_color;
+            if (any_debug) {
+                lit_color = final_color;
+            } else {
+                vec3 sun_dir = normalize(vec3(0.5, 0.8, 0.3));
+                vec3 sun_col = vec3(1.0, 0.95, 0.9);
+                float sun_intensity = 2.0;
+                float roughness = max(pc.palette_color.a, 0.04);
+
+                // Lambert diffuse.
+                float NdotL = max(dot(normal, sun_dir), 0.0);
+                vec3 diffuse = final_color * NdotL;
+
+                // GGX specular (dielectric F0 = 0.04).
+                vec3 view_dir = normalize(frag_camera_pos - hit_pos);
+                vec3 H = normalize(sun_dir + view_dir);
+                float NdotH = max(dot(normal, H), 0.0);
+                float a = roughness * roughness;
+                float a2 = a * a;
+                float denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
+                float D = a2 / (3.14159 * denom * denom + 0.0001);
+                vec3 specular = sun_col * (D * NdotL * 0.04);
+
+                // Hemisphere ambient (sky blue up, ground brown down).
+                float sky_factor = normal.y * 0.5 + 0.5;
+                vec3 sky_color = vec3(0.35, 0.40, 0.55);
+                vec3 ground_color = vec3(0.20, 0.15, 0.10);
+                vec3 ambient = final_color * mix(ground_color, sky_color, sky_factor);
+
+                lit_color = (diffuse + specular) * sun_col * sun_intensity + ambient;
+            }
+            out_color = vec4(lit_color, 1.0);
 
             // Write hardware depth (MVP expects unit-space [0,1], hit_pos is grid-space [0,dim])
             vec4 clip = pc.mvp * vec4(hit_pos / pc.grid_dim.xyz, 1.0);
