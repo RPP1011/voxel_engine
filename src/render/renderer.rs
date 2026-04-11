@@ -69,16 +69,19 @@ pub struct VoxelRenderer {
     /// source of multi-millisecond raycast spikes during pool fill-up.
     obj_pool_desc_cache: std::collections::HashMap<u64, vk::DescriptorSet>,
     voxel_sampler: vk::Sampler,
-    // Pre-allocated Vulkan objects to avoid per-frame alloc/free
+    // Pre-allocated Vulkan objects to avoid per-frame alloc/free.
+    // Two-slot pipelining: we let the CPU queue up one more render submit
+    // before the previous one finishes on the GPU, so the start-of-frame
+    // wait is for N-2's submit (essentially free once we're in steady
+    // state with GPU time < 2*CPU_frame_time). One cmd buffer, fence,
+    // and render_done semaphore per pipeline slot.
     render_cmd: [vk::CommandBuffer; 2],
-    render_fence: vk::Fence,
-    /// Binary semaphore signaled by each `render_frame_pool` submit and
-    /// consumed by the subsequent `present_blit` submit. Lets the CPU return
-    /// from `render_frame_pool` without waiting for the GPU render to finish,
-    /// while still ensuring `present_blit`'s blit reads a finished frame.
-    /// Safe as a single binary semaphore because the start-of-frame
-    /// `render_fence` wait caps us at one render in flight at a time.
-    render_done_semaphore: vk::Semaphore,
+    render_fences: [vk::Fence; 2],
+    /// Binary semaphores signaled by `render_frame_pool` submits and
+    /// consumed by subsequent `present_blit` submits. Two of them so
+    /// we can have two renders in flight without re-signaling a binary
+    /// semaphore that hasn't been consumed yet.
+    render_done_semaphores: [vk::Semaphore; 2],
     frame_index: usize,
     // Reusable per-frame Vec buffers (cleared each frame, capacity preserved)
     batch_push_buf: Vec<[u8; 176]>,
@@ -225,21 +228,26 @@ impl VoxelRenderer {
             [cmds[0], cmds[1]]
         };
 
-        // Pre-allocate a fence (created signaled so the first frame's wait succeeds)
-        let render_fence = unsafe {
-            device.create_fence(
-                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                None,
-            )
-        }?;
+        // Two-slot render pipeline: allocate one fence per slot, created
+        // signaled so the first two frames' waits complete immediately.
+        let fence_ci = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        let render_fences = unsafe {
+            [
+                device.create_fence(&fence_ci, None)?,
+                device.create_fence(&fence_ci, None)?,
+            ]
+        };
 
-        // Binary semaphore for render→present handoff. Unsignaled at creation;
-        // the first frame must NOT have anyone waiting on it before it's first
-        // signaled. The call graph guarantees render_frame_pool runs before
-        // present_blit every frame, so this holds.
-        let render_done_semaphore = unsafe {
-            device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-        }?;
+        // Two render→present handoff semaphores, one per pipeline slot.
+        // Unsignaled at creation; each render submit signals its slot's
+        // semaphore and each subsequent present_blit submit waits on it.
+        let sem_ci = vk::SemaphoreCreateInfo::default();
+        let render_done_semaphores = unsafe {
+            [
+                device.create_semaphore(&sem_ci, None)?,
+                device.create_semaphore(&sem_ci, None)?,
+            ]
+        };
 
         // NOTE: the light pass has been merged into gbuffer.frag and is no
         // longer called. We still allocate light_desc_set for API compat
@@ -287,8 +295,8 @@ impl VoxelRenderer {
             obj_pool_desc_cache: std::collections::HashMap::new(),
             voxel_sampler,
             render_cmd,
-            render_fence,
-            render_done_semaphore,
+            render_fences,
+            render_done_semaphores,
             frame_index: 0,
             batch_push_buf: Vec::new(),
         })
@@ -476,8 +484,8 @@ impl VoxelRenderer {
         // Wait for previous frame using this command buffer to finish, then reset
         let cmd = self.render_cmd[self.frame_index % 2];
         unsafe {
-            device.wait_for_fences(&[self.render_fence], true, u64::MAX)?;
-            device.reset_fences(&[self.render_fence])?;
+            device.wait_for_fences(&[self.render_fences[0]], true, u64::MAX)?;
+            device.reset_fences(&[self.render_fences[0]])?;
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
@@ -541,8 +549,8 @@ impl VoxelRenderer {
             device.end_command_buffer(cmd)?;
             let cmds = [cmd];
             let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-            device.queue_submit(gq.queue, &[submit], self.render_fence)?;
-            device.wait_for_fences(&[self.render_fence], true, u64::MAX)?;
+            device.queue_submit(gq.queue, &[submit], self.render_fences[0])?;
+            device.wait_for_fences(&[self.render_fences[0]], true, u64::MAX)?;
         }
         self.frame_index += 1;
 
@@ -618,8 +626,8 @@ impl VoxelRenderer {
         // Wait for previous frame using this command buffer to finish, then reset
         let cmd = self.render_cmd[self.frame_index % 2];
         unsafe {
-            device.wait_for_fences(&[self.render_fence], true, u64::MAX)?;
-            device.reset_fences(&[self.render_fence])?;
+            device.wait_for_fences(&[self.render_fences[0]], true, u64::MAX)?;
+            device.reset_fences(&[self.render_fences[0]])?;
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
@@ -683,8 +691,8 @@ impl VoxelRenderer {
             device.end_command_buffer(cmd)?;
             let cmds = [cmd];
             let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-            device.queue_submit(gq.queue, &[submit], self.render_fence)?;
-            device.wait_for_fences(&[self.render_fence], true, u64::MAX)?;
+            device.queue_submit(gq.queue, &[submit], self.render_fences[0])?;
+            device.wait_for_fences(&[self.render_fences[0]], true, u64::MAX)?;
         }
         self.frame_index += 1;
 
@@ -843,10 +851,18 @@ impl VoxelRenderer {
         let device = ctx.device();
         let gq = ctx.graphics_queue().unwrap();
 
-        let cmd = self.render_cmd[self.frame_index % 2];
+        // Two-slot pipelining: this frame's slot is frame_index % 2.
+        // Wait on THIS slot's fence (which was signaled by the submit
+        // from two frames ago); since the GPU per-frame time is less
+        // than two CPU frame times in steady state, that fence has
+        // usually been signaled long ago and the wait is a no-op.
+        let slot = self.frame_index % 2;
+        let cmd = self.render_cmd[slot];
+        let fence = self.render_fences[slot];
+        let signal_sem = self.render_done_semaphores[slot];
         unsafe {
-            device.wait_for_fences(&[self.render_fence], true, u64::MAX)?;
-            device.reset_fences(&[self.render_fence])?;
+            device.wait_for_fences(&[fence], true, u64::MAX)?;
+            device.reset_fences(&[fence])?;
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
@@ -876,39 +892,44 @@ impl VoxelRenderer {
         unsafe {
             device.end_command_buffer(cmd)?;
             let cmds = [cmd];
-            let signals = [self.render_done_semaphore];
+            let signals = [signal_sem];
             let submit = vk::SubmitInfo::default()
                 .command_buffers(&cmds)
                 .signal_semaphores(&signals);
-            device.queue_submit(gq.queue, &[submit], self.render_fence)?;
+            device.queue_submit(gq.queue, &[submit], fence)?;
             // No end wait_for_fences: the CPU returns immediately after
-            // queuing the render, letting the next frame's CPU work
-            // (drain/gen/sim) overlap with GPU render. The start-of-frame
-            // wait on render_fence throttles us to one render-in-flight,
-            // and present_blit waits on render_done_semaphore before its
-            // blit reads the light target.
+            // queuing the render. Two-slot pipelining means the
+            // start-of-next-frame wait is for 2 frames ago, which has
+            // usually already finished — the wait bucket approaches 0
+            // in steady state. present_blit still waits on the slot's
+            // render_done semaphore before its blit reads the gbuffer
+            // RT on the GPU side.
         }
         self.frame_index += 1;
 
         Ok(())
     }
 
-    /// Semaphore signaled by each `render_frame_pool` submit. Callers pass
-    /// this to the swapchain's present/blit step so the blit GPU-side waits
-    /// for render to finish before reading the light target.
+    /// Semaphore signaled by the most recent `render_frame_pool` submit.
+    /// Callers pass this to the swapchain's present/blit step so the blit
+    /// GPU-side waits for render to finish before reading the gbuffer RT.
     pub fn render_done_semaphore(&self) -> vk::Semaphore {
-        self.render_done_semaphore
+        // frame_index was incremented after the submit, so the last
+        // signaled semaphore is at (frame_index - 1) % 2.
+        self.render_done_semaphores[(self.frame_index + 1) % 2]
     }
 
-    /// Block the CPU until the in-flight render submit (if any) has finished.
-    /// Normally this wait sits at the top of `render_frame_pool` where its cost
-    /// is lumped into the raycast bucket; callers that want to measure the
-    /// wait separately can invoke it manually, then `render_frame_pool` will
-    /// skip the internal wait (the fence is already signaled).
+    /// Block the CPU until the render-slot that `render_frame_pool` will
+    /// reuse next has finished its previous submission. With two-slot
+    /// pipelining this is the fence from TWO frames ago, not one — in
+    /// steady state it's usually already signaled and this is a no-op,
+    /// so the `wait` bucket in the caller's perf log collapses toward
+    /// zero once the GPU is keeping up.
     pub fn wait_for_previous_frame(&self, ctx: &VulkanContext) -> Result<()> {
         let device = ctx.device();
+        let slot = self.frame_index % 2;
         unsafe {
-            device.wait_for_fences(&[self.render_fence], true, u64::MAX)?;
+            device.wait_for_fences(&[self.render_fences[slot]], true, u64::MAX)?;
         }
         Ok(())
     }
@@ -917,9 +938,13 @@ impl VoxelRenderer {
         let device = ctx.device();
         unsafe {
             // Wait for any in-flight work before destroying
-            let _ = device.wait_for_fences(&[self.render_fence], true, u64::MAX);
-            device.destroy_fence(self.render_fence, None);
-            device.destroy_semaphore(self.render_done_semaphore, None);
+            let _ = device.wait_for_fences(&self.render_fences, true, u64::MAX);
+            for f in self.render_fences {
+                device.destroy_fence(f, None);
+            }
+            for s in self.render_done_semaphores {
+                device.destroy_semaphore(s, None);
+            }
             device.free_command_buffers(self.gbuffer.command_pool(), &self.render_cmd);
             if let Some(pool) = self.obj_desc_pool {
                 device.destroy_descriptor_pool(pool, None);
