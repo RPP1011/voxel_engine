@@ -1002,6 +1002,28 @@ uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
     uint mat = base_mat;
     bool mat_is_trunk = false; // track if current mat came from a trunk voxel
 
+    // Fast-path optimization: region cells are 4096 voxels wide, so a 150-voxel
+    // halo almost never crosses a cell boundary. When it doesn't, the per-origin
+    // sample_cell + feature_params results are constant and can be hoisted out of
+    // the inner loop — and if the uniform biome has no features at all, we can
+    // skip the entire 17K-candidate scan.
+    int cell_col_min = int(floor(float(base_x + olx_min) / float(header.cell_size)));
+    int cell_col_max = int(floor(float(base_x + olx_max) / float(header.cell_size)));
+    int cell_row_min = int(floor(float(base_y + oly_min) / float(header.cell_size)));
+    int cell_row_max = int(floor(float(base_y + oly_max) / float(header.cell_size)));
+    bool uniform_halo = (cell_col_min == cell_col_max) && (cell_row_min == cell_row_max);
+    RegionCell uniform_cell;
+    FeatureParams uniform_fp;
+    if (uniform_halo) {
+        uniform_cell = sample_cell(float(base_x + olx_min), float(base_y + oly_min));
+        uniform_fp = feature_params(uniform_cell.terrain, uniform_cell.sub_biome);
+        if (uniform_fp.tree_density == 0.0
+            && uniform_fp.boulder_density == 0.0
+            && uniform_fp.pillar_density == 0.0) {
+            return base_mat; // whole halo is featureless, skip scan entirely
+        }
+    }
+
     for (int oly = oly_min; oly <= oly_max; oly++) {
         for (int olx = olx_min; olx <= olx_max; olx++) {
             int ox = base_x + olx;
@@ -1014,11 +1036,40 @@ uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
 
             // Sample cell AT this origin — the origin may be in a neighbor
             // chunk with a different biome (matches CPU per-origin sampling).
-            RegionCell origin_cell = sample_cell(float(ox), float(oy));
-            FeatureParams fp = feature_params(origin_cell.terrain, origin_cell.sub_biome);
-            if (fp.tree_density == 0.0 && fp.boulder_density == 0.0 && fp.pillar_density == 0.0) continue;
+            RegionCell origin_cell;
+            FeatureParams fp;
+            if (uniform_halo) {
+                origin_cell = uniform_cell;
+                fp = uniform_fp;
+            } else {
+                origin_cell = sample_cell(float(ox), float(oy));
+                fp = feature_params(origin_cell.terrain, origin_cell.sub_biome);
+                if (fp.tree_density == 0.0 && fp.boulder_density == 0.0 && fp.pillar_density == 0.0) continue;
+            }
 
-            // Per-column surface (expensive FBM call).
+            // Cheap density pre-checks (hash only, no FBM). Defers the
+            // expensive per-column `surface_height_at` FBM call until we know
+            // at least one feature might fire at this origin. For trees we use
+            // an UPPER BOUND on the effective density (tree_density * 1.7)
+            // because the precise density also depends on a 2-octave cluster
+            // FBM — the upper bound rejects most origins cheaply while being
+            // guaranteed-permissive (never discards a real tree).
+            bool maybe_tree = false, maybe_boulder = false, maybe_pillar = false;
+            if (fp.tree_density > 0.0) {
+                float td = hash_f32_u64_full(ox, oy, 0, seed_plus_salt(seed, SALT_TREE_DENSITY));
+                maybe_tree = (td < fp.tree_density * 1.7);
+            }
+            if (fp.boulder_density > 0.0) {
+                float bd = hash_f32_u64_full(ox, oy, 0, seed_plus_salt(seed, SALT_BOULDER_DENSITY));
+                maybe_boulder = (bd < fp.boulder_density);
+            }
+            if (fp.pillar_density > 0.0) {
+                float pd = hash_f32_u64_full(ox, oy, 0, seed_plus_salt(seed, SALT_PILLAR_DENSITY));
+                maybe_pillar = (pd < fp.pillar_density);
+            }
+            if (!maybe_tree && !maybe_boulder && !maybe_pillar) continue;
+
+            // Per-column surface (expensive 9-octave FBM — gated above).
             int col_surface_z = surface_height_at(float(ox), float(oy), seed);
             int feature_base_z = col_surface_z + 1;
 
@@ -1028,7 +1079,7 @@ uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
                 feature_base_z - 1 >= base_z + cs) continue;
 
             // Trees first (CPU order).
-            if (fp.tree_density > 0.0) {
+            if (maybe_tree) {
                 bool trunk_hit;
                 uint tm = try_tree_at(ox, oy, vx, vy, vz, feature_base_z, seed, fp, origin_cell.terrain, trunk_hit);
                 if (tm != 0xFFFFFFFFu) {
@@ -1046,7 +1097,7 @@ uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
 
             // Boulder (CPU writes unconditionally — no skip for tree columns
             // since CPU feature.rs doesn't track per-column state either).
-            if (fp.boulder_density > 0.0) {
+            if (maybe_boulder) {
                 uint bm = try_boulder_at(ox, oy, vx, vy, vz, feature_base_z, seed, fp);
                 if (bm != 0xFFFFFFFFu) {
                     mat = bm;
@@ -1055,7 +1106,7 @@ uint apply_features(int vx, int vy, int vz, uint base_mat, uint seed) {
             }
 
             // Pillar.
-            if (fp.pillar_density > 0.0) {
+            if (maybe_pillar) {
                 uint pm = try_pillar_at(ox, oy, vx, vy, vz, feature_base_z, seed, fp);
                 if (pm != 0xFFFFFFFFu) {
                     mat = pm;
