@@ -263,6 +263,14 @@ pub struct TerrainComputePipeline {
     // Ring of in-flight slots.
     slots: Vec<ComputeSlot>,
     next_request_id: u64,
+    /// Monotonically incremented whenever the set of slots returned by
+    /// `loaded_chunk_views()` changes: Loaded→Free, Loaded→InFlight (via
+    /// eviction in `submit_chunk_with_frame`), or InFlight→Loaded (via
+    /// `try_take_completed_with_frame`). Callers can cache cull output
+    /// keyed on this generation — as long as the generation is unchanged
+    /// and the camera hasn't moved, last frame's cull result is still
+    /// correct.
+    pool_generation: u64,
     // Region plan + rivers (shared across all slots; re-bound to every slot's
     // descriptor set whenever they are uploaded).
     region_cells_buffer: Option<AllocatedBuffer>,
@@ -749,6 +757,7 @@ impl TerrainComputePipeline {
             mip_shader_module,
             slots,
             next_request_id: 1,
+            pool_generation: 0,
             region_cells_buffer: None,
             region_header_buffer: None,
             placeholder_cells_buffer,
@@ -858,6 +867,9 @@ impl TerrainComputePipeline {
         for slot in self.slots.iter_mut() {
             slot.state = SlotState::Free;
         }
+        // Every previously-Loaded slot just dropped out of
+        // `loaded_chunk_views()` at once.
+        self.pool_generation += 1;
         Ok(())
     }
 
@@ -1332,6 +1344,10 @@ impl TerrainComputePipeline {
         slot.state = SlotState::InFlight(request_id);
         slot.first_use = false;
         slot.chunk_pos = chunk_pos;
+        // This slot just left `loaded_chunk_views()` (either it was a
+        // Free slot entering the pool or a Loaded slot being evicted).
+        // Either way, any cached cull output is now stale.
+        self.pool_generation += 1;
         Ok(Some(request_id))
     }
 
@@ -1377,6 +1393,8 @@ impl TerrainComputePipeline {
                     slot.state = SlotState::Loaded(slot.chunk_pos);
                     slot.last_touched_frame = current_frame;
                     completed.push((request_id, slot.chunk_pos));
+                    // A new entry just appeared in `loaded_chunk_views()`.
+                    self.pool_generation += 1;
                 }
                 Ok(false) => {
                     // Still running, leave in-flight.
@@ -1446,6 +1464,14 @@ impl TerrainComputePipeline {
     ///
     /// The pool render entry point consumes this to build per-frame
     /// descriptor sets without any CPU round-trip.
+    /// Monotonic counter that bumps whenever `loaded_chunk_views()` output
+    /// would change (slot enters/leaves the `Loaded` state). Callers that
+    /// cache iteration results can key on this to detect whether the
+    /// cache is still valid.
+    pub fn pool_generation(&self) -> u64 {
+        self.pool_generation
+    }
+
     pub fn loaded_chunk_views(&self) -> impl Iterator<Item = LoadedChunkView> + '_ {
         self.slots.iter().enumerate().filter_map(|(idx, s)| match s.state {
             SlotState::Loaded(pos) => Some(LoadedChunkView {
