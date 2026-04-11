@@ -1432,6 +1432,12 @@ impl TerrainComputePipeline {
             return Ok(Vec::new());
         }
 
+        // Tried round-robin "poll one fence per call" here in a
+        // previous iteration — it catastrophically regressed the
+        // drain rate (24/sec -> 2/sec), stalling the pool fill
+        // because the compute queue could drain faster than we could
+        // recognize completions. Each fence poll is cheap relative
+        // to the cost of holding up the entire load transition.
         let device = ctx.device();
         let mut completed = Vec::new();
         for slot in self.slots.iter_mut() {
