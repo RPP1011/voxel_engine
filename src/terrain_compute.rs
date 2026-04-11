@@ -1373,6 +1373,21 @@ impl TerrainComputePipeline {
         })
     }
 
+    /// Returns `(free, in_flight, loaded)` slot counts for the pool.
+    pub fn pool_stats(&self) -> (usize, usize, usize) {
+        let mut free = 0;
+        let mut in_flight = 0;
+        let mut loaded = 0;
+        for s in &self.slots {
+            match s.state {
+                SlotState::Free => free += 1,
+                SlotState::InFlight(_) => in_flight += 1,
+                SlotState::Loaded(_) => loaded += 1,
+            }
+        }
+        (free, in_flight, loaded)
+    }
+
     /// Iterate over all Loaded slots, yielding a full [`LoadedChunkView`] per
     /// slot. Each view is render-ready: every image is in
     /// `SHADER_READ_ONLY_OPTIMAL` and covers the main + 3 mip levels.
