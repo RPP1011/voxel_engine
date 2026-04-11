@@ -1505,6 +1505,15 @@ impl TerrainComputePipeline {
         (self.free_count, self.in_flight_count, self.loaded_count)
     }
 
+    /// Dedicated accessor for just the in-flight slot count. Used by
+    /// hot paths (e.g. the game's batch stability check) that don't
+    /// need the other two counters — skips the 2 extra field reads
+    /// that `pool_stats` tuple-returns would incur.
+    #[inline]
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight_count
+    }
+
     /// Iterate over all Loaded slots, yielding a full [`LoadedChunkView`] per
     /// slot. Each view is render-ready: every image is in
     /// `SHADER_READ_ONLY_OPTIMAL` and covers the main + 3 mip levels.
