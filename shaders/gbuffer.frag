@@ -219,7 +219,22 @@ void main() {
                 vec3 ground_color = vec3(0.20, 0.15, 0.10);
                 vec3 ambient = final_color * mix(ground_color, sky_color, sky_factor);
 
-                lit_color = (diffuse + specular) * sun_col * sun_intensity + ambient;
+                // Camera-facing fill light. Surfaces with normals
+                // pointing toward the viewer get an extra term —
+                // ensures front-facing fragments are always
+                // visible regardless of where the sun is. Without
+                // this, sun_dir at (0.5, 0.8, 0.3) lights tops + a
+                // single side bright but leaves any face whose
+                // normal points away from the sun (the typical
+                // "front" face from the viewer's perspective)
+                // dim — single-cell entities then read as missing
+                // their forward face. fill is gentle (0.4×) so it
+                // doesn't flatten the sun-driven shading on bigger
+                // shapes.
+                float NdotV = max(dot(normal, view_dir), 0.0);
+                vec3 fill = final_color * NdotV * 0.4;
+
+                lit_color = (diffuse + specular) * sun_col * sun_intensity + ambient + fill;
             }
             out_color = vec4(lit_color, 1.0);
 
@@ -253,6 +268,16 @@ void main() {
         // MIP acceleration: skip known-empty blocks at multiple scales.
         // When a block is empty, jump the DDA to the block boundary in O(1)
         // instead of stepping voxel-by-voxel.
+        //
+        // Correctness invariant: after a jump of t_advance seconds, every
+        // axis' (pos, t_max) must be bumped by however many voxel
+        // boundaries THAT axis crossed in [current_t, t_advance]. It is
+        // NOT enough to advance the single axis whose face the ray exits
+        // through — the other two axes can each cross several voxel
+        // boundaries during the jump, and leaving their `pos` stale
+        // makes every subsequent DDA step sample the wrong voxel
+        // (visible as random dark lines / phantom hits at chunk
+        // boundaries where the MIP-skip fires hardest).
 
         // MIP3: 8x8x8 block — jump skip
         {
@@ -263,23 +288,37 @@ void main() {
                     // Compute how many voxels to the exit boundary of this 8-block
                     ivec3 block_min = block * 8;
                     ivec3 block_max = block_min + 8;
-                    // For each axis, distance to exit boundary
                     int dx = (step_dir.x > 0) ? (block_max.x - pos.x) : (pos.x - block_min.x + 1);
                     int dy = (step_dir.y > 0) ? (block_max.y - pos.y) : (pos.y - block_min.y + 1);
                     int dz = (step_dir.z > 0) ? (block_max.z - pos.z) : (pos.z - block_min.z + 1);
-                    // Advance DDA state by jumping across the block
+                    // t at which the ray would exit the block via each face.
+                    // The ray actually exits the block at the smallest of these.
                     float tx = t_max.x + t_delta.x * float(dx - 1);
                     float ty = t_max.y + t_delta.y * float(dy - 1);
                     float tz = t_max.z + t_delta.z * float(dz - 1);
-                    if (tx < ty && tx < tz) {
-                        last_axis = 0; last_sign = step_dir.x;
-                        pos.x += step_dir.x * dx; t_max.x += t_delta.x * float(dx);
-                    } else if (ty < tz) {
-                        last_axis = 1; last_sign = step_dir.y;
-                        pos.y += step_dir.y * dy; t_max.y += t_delta.y * float(dy);
-                    } else {
-                        last_axis = 2; last_sign = step_dir.z;
-                        pos.z += step_dir.z * dz; t_max.z += t_delta.z * float(dz);
+                    float t_exit = min(tx, min(ty, tz));
+                    // Record which axis owns the final boundary crossing
+                    // (used for face-normal shading if the very next
+                    // voxel is a hit).
+                    if (tx <= ty && tx <= tz) { last_axis = 0; last_sign = step_dir.x; }
+                    else if (ty <= tz)        { last_axis = 1; last_sign = step_dir.y; }
+                    else                      { last_axis = 2; last_sign = step_dir.z; }
+                    // Advance every axis by the number of voxel
+                    // boundaries it actually crossed in [current_t, t_exit].
+                    if (t_max.x <= t_exit) {
+                        float n = floor((t_exit - t_max.x) / t_delta.x) + 1.0;
+                        pos.x += step_dir.x * int(n);
+                        t_max.x += t_delta.x * n;
+                    }
+                    if (t_max.y <= t_exit) {
+                        float n = floor((t_exit - t_max.y) / t_delta.y) + 1.0;
+                        pos.y += step_dir.y * int(n);
+                        t_max.y += t_delta.y * n;
+                    }
+                    if (t_max.z <= t_exit) {
+                        float n = floor((t_exit - t_max.z) / t_delta.z) + 1.0;
+                        pos.z += step_dir.z * int(n);
+                        t_max.z += t_delta.z * n;
                     }
                     step_count++;
                     continue;
@@ -301,15 +340,24 @@ void main() {
                     float tx = t_max.x + t_delta.x * float(dx - 1);
                     float ty = t_max.y + t_delta.y * float(dy - 1);
                     float tz = t_max.z + t_delta.z * float(dz - 1);
-                    if (tx < ty && tx < tz) {
-                        last_axis = 0; last_sign = step_dir.x;
-                        pos.x += step_dir.x * dx; t_max.x += t_delta.x * float(dx);
-                    } else if (ty < tz) {
-                        last_axis = 1; last_sign = step_dir.y;
-                        pos.y += step_dir.y * dy; t_max.y += t_delta.y * float(dy);
-                    } else {
-                        last_axis = 2; last_sign = step_dir.z;
-                        pos.z += step_dir.z * dz; t_max.z += t_delta.z * float(dz);
+                    float t_exit = min(tx, min(ty, tz));
+                    if (tx <= ty && tx <= tz) { last_axis = 0; last_sign = step_dir.x; }
+                    else if (ty <= tz)        { last_axis = 1; last_sign = step_dir.y; }
+                    else                      { last_axis = 2; last_sign = step_dir.z; }
+                    if (t_max.x <= t_exit) {
+                        float n = floor((t_exit - t_max.x) / t_delta.x) + 1.0;
+                        pos.x += step_dir.x * int(n);
+                        t_max.x += t_delta.x * n;
+                    }
+                    if (t_max.y <= t_exit) {
+                        float n = floor((t_exit - t_max.y) / t_delta.y) + 1.0;
+                        pos.y += step_dir.y * int(n);
+                        t_max.y += t_delta.y * n;
+                    }
+                    if (t_max.z <= t_exit) {
+                        float n = floor((t_exit - t_max.z) / t_delta.z) + 1.0;
+                        pos.z += step_dir.z * int(n);
+                        t_max.z += t_delta.z * n;
                     }
                     step_count++;
                     continue;
@@ -331,15 +379,24 @@ void main() {
                     float tx = t_max.x + t_delta.x * float(dx - 1);
                     float ty = t_max.y + t_delta.y * float(dy - 1);
                     float tz = t_max.z + t_delta.z * float(dz - 1);
-                    if (tx < ty && tx < tz) {
-                        last_axis = 0; last_sign = step_dir.x;
-                        pos.x += step_dir.x * dx; t_max.x += t_delta.x * float(dx);
-                    } else if (ty < tz) {
-                        last_axis = 1; last_sign = step_dir.y;
-                        pos.y += step_dir.y * dy; t_max.y += t_delta.y * float(dy);
-                    } else {
-                        last_axis = 2; last_sign = step_dir.z;
-                        pos.z += step_dir.z * dz; t_max.z += t_delta.z * float(dz);
+                    float t_exit = min(tx, min(ty, tz));
+                    if (tx <= ty && tx <= tz) { last_axis = 0; last_sign = step_dir.x; }
+                    else if (ty <= tz)        { last_axis = 1; last_sign = step_dir.y; }
+                    else                      { last_axis = 2; last_sign = step_dir.z; }
+                    if (t_max.x <= t_exit) {
+                        float n = floor((t_exit - t_max.x) / t_delta.x) + 1.0;
+                        pos.x += step_dir.x * int(n);
+                        t_max.x += t_delta.x * n;
+                    }
+                    if (t_max.y <= t_exit) {
+                        float n = floor((t_exit - t_max.y) / t_delta.y) + 1.0;
+                        pos.y += step_dir.y * int(n);
+                        t_max.y += t_delta.y * n;
+                    }
+                    if (t_max.z <= t_exit) {
+                        float n = floor((t_exit - t_max.z) / t_delta.z) + 1.0;
+                        pos.z += step_dir.z * int(n);
+                        t_max.z += t_delta.z * n;
                     }
                     step_count++;
                 }
