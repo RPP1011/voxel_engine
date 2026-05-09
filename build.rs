@@ -83,8 +83,7 @@ fn copy_precompiled_shaders(shader_dir: &Path, out_shader_dir: &Path) {
             if path.extension().and_then(|e| e.to_str()) == Some("spv") {
                 let file_name = path.file_name().unwrap();
                 let dest = out_shader_dir.join(file_name);
-                fs::copy(&path, &dest)
-                    .unwrap_or_else(|e| panic!("Failed to copy {:?}: {e}", path));
+                fs::copy(&path, &dest).unwrap_or_else(|e| panic!("Failed to copy {:?}: {e}", path));
             }
         }
     } else {
@@ -104,6 +103,24 @@ fn copy_precompiled_shaders(shader_dir: &Path, out_shader_dir: &Path) {
 /// how to refresh the SPV cache. See `copy_precompiled_shaders` for why this
 /// matters.
 fn check_spv_freshness(shader_dir: &Path, compiled_dir: &Path) {
+    // Self-disable when consumed as a cargo git/registry dep: the source
+    // tree lives under cargo's checkout cache, the consumer has no way to
+    // edit the shader sources, and the mtimes there are arbitrary (cargo
+    // doesn't preserve git-commit ordering on checkout). The freshness
+    // check only catches real edits in voxel_engine's own working copy.
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        if manifest_dir.contains("/.cargo/git/checkouts/")
+            || manifest_dir.contains("/.cargo/registry/src/")
+        {
+            return;
+        }
+    }
+    // Explicit escape hatch — set VOXEL_ENGINE_SKIP_FRESHNESS_CHECK=1 to
+    // bypass the check entirely (e.g. CI building a vendored snapshot).
+    if std::env::var("VOXEL_ENGINE_SKIP_FRESHNESS_CHECK").is_ok() {
+        return;
+    }
+
     let mut stale: Vec<String> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
 
