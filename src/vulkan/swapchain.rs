@@ -105,7 +105,10 @@ impl SwapchainContext {
         } else {
             vk::PresentModeKHR::FIFO // always available
         };
-        eprintln!("[voxel] Swapchain present mode: {:?} (available: {:?})", present_mode, present_modes);
+        eprintln!(
+            "[voxel] Swapchain present mode: {:?} (available: {:?})",
+            present_mode, present_modes
+        );
 
         let size = window.inner_size();
         let extent = vk::Extent2D {
@@ -119,13 +122,12 @@ impl SwapchainContext {
             ),
         };
 
-        let image_count = (capabilities.min_image_count + 1).min(
-            if capabilities.max_image_count > 0 {
+        let image_count =
+            (capabilities.min_image_count + 1).min(if capabilities.max_image_count > 0 {
                 capabilities.max_image_count
             } else {
                 u32::MAX
-            },
-        );
+            });
 
         let swapchain_loader = ash::khr::swapchain::Device::new(ctx.instance(), ctx.device());
 
@@ -218,6 +220,20 @@ impl SwapchainContext {
         })
     }
 
+    /// Per-swapchain-image colour image views — one per swapchain
+    /// image. Needed by overlay renderers (e.g. egui) that want
+    /// to draw into the same image the present blit produced.
+    pub fn image_views(&self) -> &[vk::ImageView] {
+        &self.image_views
+    }
+
+    /// Surface colour format the swapchain images were created with.
+    /// Overlay render passes need a matching format on their colour
+    /// attachment.
+    pub fn surface_format(&self) -> vk::Format {
+        self.format.format
+    }
+
     /// Pre-record N identical blit command buffers (one per swapchain
     /// image), eliminating the per-frame
     /// reset/begin/barrier/blit/barrier/end work inside `present_blit`.
@@ -280,19 +296,29 @@ impl SwapchainContext {
                     vk::PipelineStageFlags::TOP_OF_PIPE,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),
-                    &[], &[], &[to_dst],
+                    &[],
+                    &[],
+                    &[to_dst],
                 );
 
                 let blit_region = vk::ImageBlit {
                     src_subresource,
                     src_offsets: [
                         vk::Offset3D { x: 0, y: 0, z: 0 },
-                        vk::Offset3D { x: src_width as i32, y: src_height as i32, z: 1 },
+                        vk::Offset3D {
+                            x: src_width as i32,
+                            y: src_height as i32,
+                            z: 1,
+                        },
                     ],
                     dst_subresource: src_subresource,
                     dst_offsets: [
                         vk::Offset3D { x: 0, y: 0, z: 0 },
-                        vk::Offset3D { x: self.extent.width as i32, y: self.extent.height as i32, z: 1 },
+                        vk::Offset3D {
+                            x: self.extent.width as i32,
+                            y: self.extent.height as i32,
+                            z: 1,
+                        },
                     ],
                 };
                 device.cmd_blit_image(
@@ -318,7 +344,9 @@ impl SwapchainContext {
                     vk::PipelineStageFlags::TRANSFER,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     vk::DependencyFlags::empty(),
-                    &[], &[], &[to_present],
+                    &[],
+                    &[],
+                    &[to_present],
                 );
 
                 device.end_command_buffer(cmd)?;
@@ -328,8 +356,7 @@ impl SwapchainContext {
         // Per-image fences (created signaled so the first submit's wait
         // is a no-op). Recycled each time we re-submit that image's cmd.
         if self.prerecorded_blit_fences.is_none() {
-            let fence_ci = vk::FenceCreateInfo::default()
-                .flags(vk::FenceCreateFlags::SIGNALED);
+            let fence_ci = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
             let mut fences = Vec::with_capacity(image_count);
             for _ in 0..image_count {
                 fences.push(unsafe { device.create_fence(&fence_ci, None) }?);
@@ -349,7 +376,11 @@ impl SwapchainContext {
         self.extent
     }
 
-    pub fn present_cleared_frame(&mut self, ctx: &VulkanContext, clear_color: [f32; 4]) -> Result<()> {
+    pub fn present_cleared_frame(
+        &mut self,
+        ctx: &VulkanContext,
+        clear_color: [f32; 4],
+    ) -> Result<()> {
         let device = ctx.device();
         let frame = self.current_frame;
 
@@ -402,7 +433,9 @@ impl SwapchainContext {
                 cmd,
                 self.images[image_index as usize],
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &vk::ClearColorValue { float32: clear_color },
+                &vk::ClearColorValue {
+                    float32: clear_color,
+                },
                 &[vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
@@ -461,10 +494,8 @@ impl SwapchainContext {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
 
-        unsafe {
-            self.swapchain_loader.queue_present(gq.queue, &present_info)
-        }
-        .context("Failed to present")?;
+        unsafe { self.swapchain_loader.queue_present(gq.queue, &present_info) }
+            .context("Failed to present")?;
 
         self.current_frame = (self.current_frame + 1) % self.max_frames_in_flight;
         Ok(())
@@ -502,9 +533,7 @@ impl SwapchainContext {
         // Determine if we need to swizzle R<->B
         let need_swizzle = matches!(
             self.format.format,
-            vk::Format::B8G8R8A8_SRGB
-                | vk::Format::B8G8R8A8_UNORM
-                | vk::Format::B8G8R8A8_SNORM
+            vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SNORM
         );
 
         // Create staging buffer with pixel data
@@ -536,16 +565,13 @@ impl SwapchainContext {
             .memory_type_index(mem_type);
         let staging_memory = unsafe { device.allocate_memory(&alloc_info, None) }
             .context("Failed to allocate staging memory")?;
-        unsafe {
-            device.bind_buffer_memory(staging_buffer, staging_memory, 0)
-        }
-        .context("Failed to bind staging buffer")?;
+        unsafe { device.bind_buffer_memory(staging_buffer, staging_memory, 0) }
+            .context("Failed to bind staging buffer")?;
 
         // Map and copy pixel data
-        let ptr = unsafe {
-            device.map_memory(staging_memory, 0, byte_size, vk::MemoryMapFlags::empty())
-        }
-        .context("Failed to map staging memory")? as *mut u8;
+        let ptr =
+            unsafe { device.map_memory(staging_memory, 0, byte_size, vk::MemoryMapFlags::empty()) }
+                .context("Failed to map staging memory")? as *mut u8;
 
         if need_swizzle {
             // Swizzle RGBA -> BGRA
@@ -670,11 +696,8 @@ impl SwapchainContext {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
 
-        unsafe {
-            self.swapchain_loader
-                .queue_present(gq.queue, &present_info)
-        }
-        .context("Failed to present")?;
+        unsafe { self.swapchain_loader.queue_present(gq.queue, &present_info) }
+            .context("Failed to present")?;
 
         // Cleanup staging buffer (we waited on fence at start so this is safe for the
         // *previous* frame's staging; for current frame the GPU hasn't finished yet,
@@ -739,9 +762,15 @@ impl SwapchainContext {
         }
 
         let wait_semaphores_full: [vk::Semaphore; 2] = [self.image_available[frame], extra_wait];
-        let wait_stages_full: [vk::PipelineStageFlags; 2] =
-            [vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER];
-        let wait_count = if extra_wait == vk::Semaphore::null() { 1 } else { 2 };
+        let wait_stages_full: [vk::PipelineStageFlags; 2] = [
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+        ];
+        let wait_count = if extra_wait == vk::Semaphore::null() {
+            1
+        } else {
+            2
+        };
         let wait_semaphores = &wait_semaphores_full[..wait_count];
         let wait_stages = &wait_stages_full[..wait_count];
         let signal_semaphores = [self.render_finished[frame]];
@@ -765,11 +794,196 @@ impl SwapchainContext {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
 
+        unsafe { self.swapchain_loader.queue_present(gq.queue, &present_info) }
+            .context("Failed to present")?;
+
+        self.current_frame = (self.current_frame + 1) % self.max_frames_in_flight;
+        Ok(())
+    }
+
+    /// Like `present_blit_with_wait`, but additionally calls
+    /// `overlay` between the blit and the final layout
+    /// transition. The closure receives the active command
+    /// buffer + the swapchain image index; it MUST record its
+    /// draws into a render pass whose:
+    /// - colour attachment uses the swapchain image view at that
+    ///   index,
+    /// - `loadOp` is `LOAD` (so the freshly-blitted contents
+    ///   stay underneath),
+    /// - `initialLayout` is `COLOR_ATTACHMENT_OPTIMAL` (the
+    ///   barrier we insert between the blit and the closure
+    ///   transitions to that),
+    /// - `finalLayout` is `PRESENT_SRC_KHR` (we skip the trailing
+    ///   barrier that the no-overlay path would otherwise add).
+    ///
+    /// Always uses the per-frame slow path — the pre-recorded
+    /// optimisation is bypassed because an overlay's commands
+    /// change every frame.
+    pub fn present_blit_with_overlay<F>(
+        &mut self,
+        ctx: &VulkanContext,
+        src_image: vk::Image,
+        src_width: u32,
+        src_height: u32,
+        extra_wait: vk::Semaphore,
+        overlay: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(vk::CommandBuffer, usize) -> Result<()>,
+    {
+        let device = ctx.device();
+        let frame = self.current_frame;
+
         unsafe {
-            self.swapchain_loader
-                .queue_present(gq.queue, &present_info)
+            device.wait_for_fences(&[self.in_flight[frame]], true, u64::MAX)?;
+            device.reset_fences(&[self.in_flight[frame]])?;
         }
-        .context("Failed to present")?;
+
+        let (image_index, _suboptimal) = unsafe {
+            self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                u64::MAX,
+                self.image_available[frame],
+                vk::Fence::null(),
+            )
+        }
+        .context("Failed to acquire next image")?;
+
+        let cmd = self.command_buffers[frame];
+        let dst_image = self.images[image_index as usize];
+        let color_subresource = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+
+        unsafe {
+            device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
+
+            // UNDEFINED → TRANSFER_DST_OPTIMAL for the blit.
+            let barrier_dst = vk::ImageMemoryBarrier::default()
+                .image(dst_image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .subresource_range(color_subresource);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier_dst],
+            );
+
+            let src_subresource = vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            let blit_region = vk::ImageBlit {
+                src_subresource,
+                src_offsets: [
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: src_width as i32,
+                        y: src_height as i32,
+                        z: 1,
+                    },
+                ],
+                dst_subresource: src_subresource,
+                dst_offsets: [
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: self.extent.width as i32,
+                        y: self.extent.height as i32,
+                        z: 1,
+                    },
+                ],
+            };
+            device.cmd_blit_image(
+                cmd,
+                src_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[blit_region],
+                vk::Filter::LINEAR,
+            );
+
+            // TRANSFER_DST → COLOR_ATTACHMENT_OPTIMAL so the
+            // overlay's render pass can use it as a colour
+            // attachment with LOAD_OP_LOAD.
+            let barrier_overlay = vk::ImageMemoryBarrier::default()
+                .image(dst_image)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::COLOR_ATTACHMENT_READ
+                        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                )
+                .subresource_range(color_subresource);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier_overlay],
+            );
+        }
+
+        // Run the overlay callback — caller records render pass
+        // begin / draws / end. The render pass's finalLayout
+        // contract is PRESENT_SRC_KHR.
+        overlay(cmd, image_index as usize)?;
+
+        unsafe {
+            device.end_command_buffer(cmd)?;
+        }
+
+        let wait_semaphores_full: [vk::Semaphore; 2] = [self.image_available[frame], extra_wait];
+        let wait_stages_full: [vk::PipelineStageFlags; 2] = [
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        ];
+        let wait_count = if extra_wait == vk::Semaphore::null() {
+            1
+        } else {
+            2
+        };
+        let wait_semaphores = &wait_semaphores_full[..wait_count];
+        let wait_stages = &wait_stages_full[..wait_count];
+        let signal_semaphores = [self.render_finished[frame]];
+        let cmd_bufs = [cmd];
+        let submit_info = vk::SubmitInfo::default()
+            .wait_semaphores(wait_semaphores)
+            .wait_dst_stage_mask(wait_stages)
+            .command_buffers(&cmd_bufs)
+            .signal_semaphores(&signal_semaphores);
+
+        let gq = ctx.graphics_queue().unwrap();
+        unsafe {
+            device.queue_submit(gq.queue, &[submit_info], self.in_flight[frame])?;
+        }
+
+        let swapchains = [self.swapchain];
+        let image_indices = [image_index];
+        let present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&signal_semaphores)
+            .swapchains(&swapchains)
+            .image_indices(&image_indices);
+
+        unsafe { self.swapchain_loader.queue_present(gq.queue, &present_info) }
+            .context("Failed to present")?;
 
         self.current_frame = (self.current_frame + 1) % self.max_frames_in_flight;
         Ok(())
@@ -839,7 +1053,9 @@ impl SwapchainContext {
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
-                &[], &[], &[barrier_dst],
+                &[],
+                &[],
+                &[barrier_dst],
             );
 
             // Blit from source image to swapchain image (handles upscaling + format conversion)
@@ -853,7 +1069,11 @@ impl SwapchainContext {
                 src_subresource,
                 src_offsets: [
                     vk::Offset3D { x: 0, y: 0, z: 0 },
-                    vk::Offset3D { x: src_width as i32, y: src_height as i32, z: 1 },
+                    vk::Offset3D {
+                        x: src_width as i32,
+                        y: src_height as i32,
+                        z: 1,
+                    },
                 ],
                 dst_subresource: src_subresource,
                 dst_offsets: [
@@ -888,7 +1108,9 @@ impl SwapchainContext {
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 vk::DependencyFlags::empty(),
-                &[], &[], &[barrier_present],
+                &[],
+                &[],
+                &[barrier_present],
             );
 
             device.end_command_buffer(cmd)?;
@@ -897,9 +1119,15 @@ impl SwapchainContext {
         // Submit — wait for both the swapchain image to be acquired AND
         // (optionally) the renderer's output to have finished writing.
         let wait_semaphores_full: [vk::Semaphore; 2] = [self.image_available[frame], extra_wait];
-        let wait_stages_full: [vk::PipelineStageFlags; 2] =
-            [vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER];
-        let wait_count = if extra_wait == vk::Semaphore::null() { 1 } else { 2 };
+        let wait_stages_full: [vk::PipelineStageFlags; 2] = [
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+        ];
+        let wait_count = if extra_wait == vk::Semaphore::null() {
+            1
+        } else {
+            2
+        };
         let wait_semaphores = &wait_semaphores_full[..wait_count];
         let wait_stages = &wait_stages_full[..wait_count];
         let signal_semaphores = [self.render_finished[frame]];
@@ -923,11 +1151,8 @@ impl SwapchainContext {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
 
-        unsafe {
-            self.swapchain_loader
-                .queue_present(gq.queue, &present_info)
-        }
-        .context("Failed to present")?;
+        unsafe { self.swapchain_loader.queue_present(gq.queue, &present_info) }
+            .context("Failed to present")?;
 
         self.current_frame = (self.current_frame + 1) % self.max_frames_in_flight;
         Ok(())
@@ -950,7 +1175,8 @@ impl SwapchainContext {
             for &view in &self.image_views {
                 device.destroy_image_view(view, None);
             }
-            self.swapchain_loader.destroy_swapchain(self.swapchain, None);
+            self.swapchain_loader
+                .destroy_swapchain(self.swapchain, None);
             self.surface_loader.destroy_surface(self.surface, None);
         }
     }

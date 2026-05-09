@@ -5,14 +5,25 @@ edition = "2024"
 
 [features]
 default = []
-app-harness = ["dep:winit", "dep:egui"]
+# `app-harness` pulls a windowed UI stack: winit for window/input,
+# egui for immediate-mode panels + plots, and egui-ash-renderer
+# (with the gpu-allocator feature so it shares our existing
+# allocator) for the Vulkan paint side. Sim-engine consumers that
+# don't render in a window stay off this feature and pay nothing.
+app-harness = [
+    "dep:winit",
+    "dep:egui",
+    "dep:egui-winit",
+    "dep:egui-ash-renderer",
+    "dep:egui_plot",
+]
 compile-shaders = []
 tracing = ["dep:tracing"]
 
 [dependencies]
 ash = "0.38"
 ash-window = "0.13"
-gpu-allocator = { version = "0.27", features = ["vulkan"] }
+gpu-allocator = { version = "0.28", features = ["vulkan"] }
 raw-window-handle = "0.6"
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
@@ -21,9 +32,12 @@ thiserror = "2"
 anyhow = "1"
 dot_vox = "5"
 
-# Optional
+# Optional — `app-harness` feature.
 winit = { version = "0.30", optional = true }
-egui = { version = "0.31", optional = true }
+egui = { version = "0.33", optional = true }
+egui-winit = { version = "0.33", optional = true }
+egui-ash-renderer = { version = "0.11", default-features = false, features = ["gpu-allocator"], optional = true }
+egui_plot = { version = "0.33", optional = true }
 tracing = { version = "0.1", optional = true }
 
 [build-dependencies]
