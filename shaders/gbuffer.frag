@@ -194,9 +194,19 @@ void main() {
             if (any_debug) {
                 lit_color = final_color;
             } else {
-                vec3 sun_dir = normalize(vec3(0.5, 0.8, 0.3));
+                // Oblique sun — more side-light, less straight-down.
+                // With Y-dominant suns, a top-down camera sees mostly
+                // top faces lit hot and the rest in shadow, washing
+                // colours toward white. Lateral sun (X/Z components
+                // close to Y) puts shading variation across agent
+                // faces visible to the camera, keeping palette
+                // colours legible.
+                vec3 sun_dir = normalize(vec3(0.6, 0.5, 0.6));
                 vec3 sun_col = vec3(1.0, 0.95, 0.9);
-                float sun_intensity = 2.0;
+                // Intensity dialled back from 2.0 to keep
+                // diffuse + fill + ambient inside the [0, 1]
+                // display range without clipping.
+                float sun_intensity = 1.2;
                 float roughness = max(pc.palette_color.a, 0.04);
 
                 // Lambert diffuse.
@@ -232,7 +242,11 @@ void main() {
                 // doesn't flatten the sun-driven shading on bigger
                 // shapes.
                 float NdotV = max(dot(normal, view_dir), 0.0);
-                vec3 fill = final_color * NdotV * 0.4;
+                // Fill weight reduced from 0.4 → 0.25 to stop the
+                // camera-facing surface from dominating now that
+                // the sun also contributes from a similar angle
+                // under a top-down camera.
+                vec3 fill = final_color * NdotV * 0.25;
 
                 lit_color = (diffuse + specular) * sun_col * sun_intensity + ambient + fill;
             }
