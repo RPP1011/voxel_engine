@@ -109,6 +109,12 @@ fn check_spv_freshness(shader_dir: &Path, compiled_dir: &Path) {
     // doesn't preserve git-commit ordering on checkout). The freshness
     // check only catches real edits in voxel_engine's own working copy.
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        // Normalise separators first: on Windows CARGO_MANIFEST_DIR reads
+        // `C:\Users\me\.cargo\git\checkouts\...`, so matching forward slashes
+        // alone never fired there — every Windows consumer of this crate as a
+        // git dep hit the freshness panic against cargo's own checkout, which
+        // is precisely the case this guard exists to skip.
+        let manifest_dir = manifest_dir.replace('\\', "/");
         if manifest_dir.contains("/.cargo/git/checkouts/")
             || manifest_dir.contains("/.cargo/registry/src/")
         {
