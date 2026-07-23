@@ -41,7 +41,7 @@ egui_plot = { version = "0.33", optional = true }
 tracing = { version = "0.1", optional = true }
 
 [build-dependencies]
-shaderc = "0.8"
+shaderc = "0.10"
 
 [dev-dependencies]
 env_logger = "0.11"
